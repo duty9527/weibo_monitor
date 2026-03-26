@@ -1,0 +1,18 @@
+.DS_Store
+.venv/
+
+# Local secrets and runtime state
+weibo_monitor_go/config.yaml
+weibo_monitor_go/weibo_history.jsonl
+weibo_monitor_go/media_downloads/
+weibo_user_data/
+
+# Generated data artifacts
+clean_history.jsonl
+cleaned_data.jsonl
+tomkeeper_messages.jsonl
+dashboard_data.json
+dashboard.html
+meta_query_result.json
+raw_image_msg.json
+downloaded_screenshot*.png
