@@ -24,6 +24,11 @@ type CookieExtractor struct {
 	logger      *slog.Logger
 }
 
+type ExtractResult struct {
+	CookieString   string
+	UsedPlaywright bool
+}
+
 // NewCookieExtractor 创建提取器。
 func NewCookieExtractor(userDataDir string, logger *slog.Logger) *CookieExtractor {
 	return &CookieExtractor{userDataDir: userDataDir, logger: logger}
@@ -31,10 +36,19 @@ func NewCookieExtractor(userDataDir string, logger *slog.Logger) *CookieExtracto
 
 // ExtractOrLogin 优先尝试直接读取 Cookie，失败后使用纯 Go Playwright 打开持久化上下文读取/等待登录。
 func (e *CookieExtractor) ExtractOrLogin(ctx context.Context, cfg config.WeiboConfig) (string, error) {
+	result, err := e.ExtractOrLoginResult(ctx, cfg)
+	if err != nil {
+		return "", err
+	}
+	return result.CookieString, nil
+}
+
+// ExtractOrLoginResult 返回 Cookie 和是否使用了 Playwright。
+func (e *CookieExtractor) ExtractOrLoginResult(ctx context.Context, cfg config.WeiboConfig) (*ExtractResult, error) {
 	cookieStr, err := e.Extract(ctx)
 	if err == nil && cookieStr != "" && VerifyCookies(ctx, cookieStr, cfg.TargetUID) {
 		e.logger.Info("通过本地存储直接读取到有效 Cookie")
-		return cookieStr, nil
+		return &ExtractResult{CookieString: cookieStr}, nil
 	}
 	if err != nil {
 		e.logger.Info("本地直读未拿到可用 Cookie，切换到 Playwright 持久化上下文", "reason", err)
@@ -42,7 +56,11 @@ func (e *CookieExtractor) ExtractOrLogin(ctx context.Context, cfg config.WeiboCo
 		e.logger.Info("本地直读拿到的 Cookie 校验未通过，切换到 Playwright 持久化上下文")
 	}
 
-	return e.ExtractViaPlaywright(ctx, cfg)
+	cookieStr, err = e.ExtractViaPlaywright(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	return &ExtractResult{CookieString: cookieStr, UsedPlaywright: true}, nil
 }
 
 // Extract 只尝试从磁盘上的浏览器存储读取 Cookie，不触发浏览器自动化。
@@ -80,6 +98,11 @@ func (e *CookieExtractor) ExtractViaPlaywright(ctx context.Context, cfg config.W
 	}
 
 	return e.extractViaPlaywrightSession(ctx, cfg, false, true)
+}
+
+// RefreshViaPlaywright 使用持久化浏览器上下文主动访问微博，尝试刷新登录态但不等待人工登录。
+func (e *CookieExtractor) RefreshViaPlaywright(ctx context.Context, cfg config.WeiboConfig) (string, error) {
+	return e.extractViaPlaywrightSession(ctx, cfg, true, false)
 }
 
 func (e *CookieExtractor) extractViaPlaywrightSession(
@@ -122,14 +145,6 @@ func (e *CookieExtractor) extractViaPlaywrightSession(
 	}
 	defer browserContext.Close()
 
-	if cookieStr, err := e.readValidCookiesFromContext(ctx, browserContext, cfg); err == nil && cookieStr != "" {
-		return cookieStr, nil
-	}
-
-	if !waitForLogin {
-		return "", fmt.Errorf("持久化上下文中暂无有效微博 Cookie")
-	}
-
 	page, err := ensureContextPage(browserContext)
 	if err != nil {
 		return "", fmt.Errorf("创建 Playwright 页面失败: %w", err)
@@ -143,7 +158,17 @@ func (e *CookieExtractor) extractViaPlaywrightSession(
 		loginURL = fmt.Sprintf("https://weibo.com/u/%s", cfg.TargetUID)
 	}
 	if _, err := page.Goto(loginURL); err != nil {
-		e.logger.Warn("导航到微博登录页失败，但将继续等待用户登录", "url", loginURL, "err", err)
+		e.logger.Warn("导航到微博登录页失败，但将继续读取 Cookie", "url", loginURL, "err", err)
+	} else {
+		page.WaitForTimeout(3000)
+	}
+
+	if cookieStr, err := e.readValidCookiesFromContext(ctx, browserContext, cfg); err == nil && cookieStr != "" {
+		return cookieStr, nil
+	}
+
+	if !waitForLogin {
+		return "", fmt.Errorf("持久化上下文中暂无有效微博 Cookie")
 	}
 
 	e.logger.Info(

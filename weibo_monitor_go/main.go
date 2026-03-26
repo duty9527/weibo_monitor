@@ -29,45 +29,32 @@ func main() {
 	logger := newLogger(cfg.Log.Level)
 	logger.Info("配置加载完成", "config", *configPath)
 
+	state, err := weibo.LoadRunState(cfg.Weibo.StateFile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "加载状态文件失败: %v\n", err)
+		os.Exit(1)
+	}
+	if err := ensureInitialState(cfg, state, logger); err != nil {
+		fmt.Fprintf(os.Stderr, "初始化状态文件失败: %v\n", err)
+		os.Exit(1)
+	}
+	applyStateSinceTime(cfg, state, logger)
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	notifier := telegram.NewClient(cfg.Telegram, logger)
 
-	runOnce := func() error {
-		return executeOnce(ctx, cfg, logger, notifier)
-	}
-
-	if err := runOnce(); err != nil {
+	if err := executeOnce(ctx, cfg, state, logger, notifier); err != nil {
 		logger.Error("执行任务失败", "err", err)
 		os.Exit(1)
-	}
-
-	if cfg.Weibo.PollIntervalSeconds <= 0 {
-		return
-	}
-
-	ticker := time.NewTicker(time.Duration(cfg.Weibo.PollIntervalSeconds) * time.Second)
-	defer ticker.Stop()
-
-	logger.Info("进入轮询模式", "interval_seconds", cfg.Weibo.PollIntervalSeconds)
-
-	for {
-		select {
-		case <-ctx.Done():
-			logger.Info("收到退出信号，程序结束")
-			return
-		case <-ticker.C:
-			if err := runOnce(); err != nil {
-				logger.Error("轮询执行失败", "err", err)
-			}
-		}
 	}
 }
 
 func executeOnce(
 	ctx context.Context,
 	cfg *config.Config,
+	state *weibo.RunState,
 	logger *slog.Logger,
 	notifier *telegram.Client,
 ) error {
@@ -75,12 +62,23 @@ func executeOnce(
 		"开始执行抓取任务",
 		"target_uid", cfg.Weibo.TargetUID,
 		"since_time", cfg.Weibo.SinceTime,
+		"state_file", cfg.Weibo.StateFile,
 		"telegram_enabled", cfg.Telegram.Enabled,
 	)
 
-	cookieStr, err := loadCookies(ctx, cfg, logger)
+	if err := maybeRefreshCookiesViaPlaywright(ctx, cfg, state, logger); err != nil {
+		logger.Warn("按计划刷新 Playwright Cookie 失败，将继续使用现有 Cookie", "err", err)
+	}
+
+	cookieStr, usedPlaywright, err := loadCookies(ctx, cfg, logger)
 	if err != nil {
 		return err
+	}
+	if usedPlaywright {
+		state.SetLastPlaywrightRefreshTime(time.Now())
+		if err := weibo.SaveRunState(cfg.Weibo.StateFile, state); err != nil {
+			logger.Warn("更新状态文件失败", "err", err)
+		}
 	}
 	if !weibo.VerifyCookies(ctx, cookieStr, cfg.Weibo.TargetUID) {
 		return fmt.Errorf("微博 Cookie 校验失败，请重新登录或更新 cookie 配置")
@@ -95,6 +93,14 @@ func executeOnce(
 	records, err := scraper.FetchNewRecords(ctx)
 	if err != nil {
 		return err
+	}
+	if latestFetchedAt, ok := scraper.LatestFetchedTime(); ok {
+		state.SetLastFetchedTime(latestFetchedAt)
+		if err := weibo.SaveRunState(cfg.Weibo.StateFile, state); err != nil {
+			logger.Warn("写入最新抓取时间失败", "err", err)
+		} else {
+			cfg.Weibo.SinceTime = latestFetchedAt.In(time.Local).Format(time.RFC3339)
+		}
 	}
 	if len(records) == 0 {
 		logger.Info("本轮没有发现新微博")
@@ -119,19 +125,90 @@ func executeOnce(
 	return nil
 }
 
-func loadCookies(ctx context.Context, cfg *config.Config, logger *slog.Logger) (string, error) {
+func loadCookies(ctx context.Context, cfg *config.Config, logger *slog.Logger) (string, bool, error) {
 	if cookieStr := strings.TrimSpace(cfg.Weibo.CookieString); cookieStr != "" {
 		logger.Info("使用配置中的 cookie_string")
-		return cookieStr, nil
+		return cookieStr, false, nil
 	}
 
 	if cookieFile := strings.TrimSpace(cfg.Weibo.CookieFile); cookieFile != "" {
 		logger.Info("从 cookie_file 加载 Cookie", "path", cookieFile)
-		return weibo.ReadNetscapeCookies(cookieFile)
+		cookieStr, err := weibo.ReadNetscapeCookies(cookieFile)
+		return cookieStr, false, err
 	}
 
 	extractor := weibo.NewCookieExtractor(cfg.Weibo.UserDataDir, logger)
-	return extractor.ExtractOrLogin(ctx, cfg.Weibo)
+	result, err := extractor.ExtractOrLoginResult(ctx, cfg.Weibo)
+	if err != nil {
+		return "", false, err
+	}
+	return result.CookieString, result.UsedPlaywright, nil
+}
+
+func maybeRefreshCookiesViaPlaywright(ctx context.Context, cfg *config.Config, state *weibo.RunState, logger *slog.Logger) error {
+	if strings.TrimSpace(cfg.Weibo.CookieString) != "" || strings.TrimSpace(cfg.Weibo.CookieFile) != "" {
+		return nil
+	}
+
+	refreshEvery := time.Duration(cfg.Weibo.PlaywrightRefreshHours) * time.Hour
+	if refreshEvery <= 0 {
+		return nil
+	}
+
+	lastRefresh, ok := state.LastPlaywrightRefreshTime()
+	if ok && time.Since(lastRefresh) < refreshEvery {
+		return nil
+	}
+
+	logger.Info("达到 Playwright Cookie 刷新时间，开始保活", "refresh_hours", cfg.Weibo.PlaywrightRefreshHours)
+
+	extractor := weibo.NewCookieExtractor(cfg.Weibo.UserDataDir, logger)
+	if _, err := extractor.RefreshViaPlaywright(ctx, cfg.Weibo); err != nil {
+		return err
+	}
+
+	state.SetLastPlaywrightRefreshTime(time.Now())
+	if err := weibo.SaveRunState(cfg.Weibo.StateFile, state); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func applyStateSinceTime(cfg *config.Config, state *weibo.RunState, logger *slog.Logger) {
+	if state == nil {
+		return
+	}
+
+	lastFetchedAt, ok := state.LastFetchedTime()
+	if !ok {
+		return
+	}
+
+	cfg.Weibo.SinceTime = lastFetchedAt.In(time.Local).Format(time.RFC3339)
+	logger.Info("应用状态文件中的增量抓取时间", "since_time", cfg.Weibo.SinceTime)
+}
+
+func ensureInitialState(cfg *config.Config, state *weibo.RunState, logger *slog.Logger) error {
+	if state == nil {
+		return nil
+	}
+	if _, ok := state.LastFetchedTime(); ok {
+		return nil
+	}
+
+	initialSince, err := weibo.ParseConfigTime(cfg.Weibo.SinceTime)
+	if err != nil {
+		return fmt.Errorf("解析初始 since_time 失败: %w", err)
+	}
+
+	state.SetLastFetchedTime(initialSince)
+	if err := weibo.SaveRunState(cfg.Weibo.StateFile, state); err != nil {
+		return err
+	}
+
+	logger.Info("首次运行，已按配置初始化状态文件", "since_time", state.LastFetchedAt, "state_file", cfg.Weibo.StateFile)
+	return nil
 }
 
 func newLogger(level string) *slog.Logger {

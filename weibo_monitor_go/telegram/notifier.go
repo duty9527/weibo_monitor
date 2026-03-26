@@ -15,6 +15,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"weibo_monitor/config"
 	"weibo_monitor/weibo"
@@ -169,9 +171,7 @@ func (c *Client) sendMediaSet(ctx context.Context, items []mediaItem, caption st
 		captionUsed := false
 		for start := 0; start < len(items); start += mediaGroupLimit {
 			end := start + mediaGroupLimit
-			if end > len(items) {
-				end = len(items)
-			}
+			end = min(len(items), end)
 
 			groupCaption := ""
 			if !captionUsed {
@@ -268,6 +268,7 @@ func (c *Client) sendMediaGroup(ctx context.Context, items []mediaItem, caption 
 
 	media := make([]inputMedia, 0, len(items))
 	files := make([]*os.File, 0, len(items))
+	showCaptionAboveMedia := strings.TrimSpace(caption) != ""
 	defer func() {
 		for _, file := range files {
 			file.Close()
@@ -283,12 +284,12 @@ func (c *Client) sendMediaGroup(ctx context.Context, items []mediaItem, caption 
 
 		attachName := fmt.Sprintf("file%d", i)
 		entry := inputMedia{
-			Type:  item.Type,
-			Media: "attach://" + attachName,
+			Type:                  item.Type,
+			Media:                 "attach://" + attachName,
+			ShowCaptionAboveMedia: showCaptionAboveMedia,
 		}
 		if i == 0 && strings.TrimSpace(caption) != "" {
 			entry.Caption = caption
-			entry.ShowCaptionAboveMedia = true
 		}
 		media = append(media, entry)
 
@@ -412,7 +413,7 @@ func formatRecordMessage(record *weibo.WeiboRecord) string {
 
 	text := strings.TrimSpace(record.Text)
 	if text != "" {
-		lines = append(lines, "", text)
+		lines = append(lines, "", normalizeTelegramText(text))
 	}
 
 	sourceURL := strings.TrimSpace(record.SourceURL)
@@ -424,6 +425,86 @@ func formatRecordMessage(record *weibo.WeiboRecord) string {
 		return "微博更新"
 	}
 	return strings.TrimSpace(strings.Join(lines, "\n"))
+}
+
+func normalizeTelegramText(text string) string {
+	if !strings.Contains(text, "http://") && !strings.Contains(text, "https://") {
+		return text
+	}
+
+	var builder strings.Builder
+	builder.Grow(len(text) + 8)
+
+	for i := 0; i < len(text); {
+		if strings.HasPrefix(text[i:], "http://") || strings.HasPrefix(text[i:], "https://") {
+			start := i
+			for i < len(text) {
+				b := text[i]
+				if b >= utf8.RuneSelf || unicode.IsSpace(rune(b)) {
+					break
+				}
+				i++
+			}
+			urlPart, trailing := splitTelegramURLSuffix(text[start:i])
+			builder.WriteString(urlPart)
+			if trailing != "" {
+				builder.WriteByte(' ')
+				builder.WriteString(trailing)
+			}
+			if i < len(text) {
+				r, size := utf8.DecodeRuneInString(text[i:])
+				if unicode.IsLetter(r) || unicode.IsNumber(r) || needsTelegramURLSeparator(r) {
+					builder.WriteByte(' ')
+				}
+				builder.WriteRune(r)
+				i += size
+			}
+			continue
+		}
+
+		r, size := utf8.DecodeRuneInString(text[i:])
+		builder.WriteRune(r)
+		i += size
+	}
+
+	return builder.String()
+}
+
+func splitTelegramURLSuffix(value string) (string, string) {
+	end := len(value)
+	for end > 0 {
+		r, size := utf8.DecodeLastRuneInString(value[:end])
+		if !isTelegramURLTrailingPunctuation(r) {
+			break
+		}
+		end -= size
+	}
+	return value[:end], value[end:]
+}
+
+func needsTelegramURLSeparator(r rune) bool {
+	return isTelegramURLTrailingPunctuation(r) || isTelegramURLAdjacentBracket(r)
+}
+
+func isTelegramURLTrailingPunctuation(r rune) bool {
+	switch r {
+	case '.', ',', ';', ':', '!', '?',
+		'，', '。', '、', '；', '：', '！', '？',
+		')', ']', '}', '>', '）', '】', '》', '」', '』', '〉', '〕', '］', '｝',
+		'"', '\'', '”', '’':
+		return true
+	default:
+		return false
+	}
+}
+
+func isTelegramURLAdjacentBracket(r rune) bool {
+	switch r {
+	case '(', '[', '{', '<', '（', '【', '《', '「', '『', '〈', '〔', '［', '｛':
+		return true
+	default:
+		return false
+	}
 }
 
 func formatRecordTag(record *weibo.WeiboRecord) string {

@@ -18,12 +18,14 @@ import (
 
 // Scraper 微博抓取核心逻辑。
 type Scraper struct {
-	cfg            *config.Config
-	httpClient     *http.Client
-	sessionHeaders map[string]string
-	logger         *slog.Logger
-	sinceTime      time.Time
-	hasSinceTime   bool
+	cfg                *config.Config
+	httpClient         *http.Client
+	sessionHeaders     map[string]string
+	logger             *slog.Logger
+	sinceTime          time.Time
+	hasSinceTime       bool
+	latestFetchedAt    time.Time
+	hasLatestFetchedAt bool
 }
 
 // NewScraper 创建抓取器并解析时间节点。
@@ -52,6 +54,13 @@ func NewScraper(cfg *config.Config, logger *slog.Logger) (*Scraper, error) {
 // SetCookies 注入 Cookie 并构造请求头。
 func (s *Scraper) SetCookies(cookieStr string) {
 	s.sessionHeaders = buildSessionHeaders(cookieStr, s.cfg.Weibo.TargetUID)
+}
+
+func (s *Scraper) LatestFetchedTime() (time.Time, bool) {
+	if !s.hasLatestFetchedAt {
+		return time.Time{}, false
+	}
+	return s.latestFetchedAt, true
 }
 
 func buildSessionHeaders(cookieStr, targetUID string) map[string]string {
@@ -396,6 +405,8 @@ func (s *Scraper) FetchNewRecords(ctx context.Context) ([]*WeiboRecord, error) {
 		return nil, nil
 	}
 
+	s.captureLatestFetchedTime(allItems)
+
 	seenInBatch := make(map[string]bool, len(allItems))
 	uniqueItems := make([]WeiboItem, 0, len(allItems))
 	for _, item := range allItems {
@@ -459,6 +470,23 @@ func (s *Scraper) FetchNewRecords(ctx context.Context) ([]*WeiboRecord, error) {
 
 	s.logger.Info("抓取完成", "new_count", len(newRecords))
 	return newRecords, nil
+}
+
+func (s *Scraper) captureLatestFetchedTime(items []WeiboItem) {
+	s.latestFetchedAt = time.Time{}
+	s.hasLatestFetchedAt = false
+
+	for _, item := range items {
+		createdAt, err := ParseWeiboTime(item.CreatedAt)
+		if err != nil {
+			s.logger.Warn("微博时间解析失败，无法写入最新抓取时间", "created_at", item.CreatedAt, "err", err)
+			continue
+		}
+		if !s.hasLatestFetchedAt || createdAt.After(s.latestFetchedAt) {
+			s.latestFetchedAt = createdAt
+			s.hasLatestFetchedAt = true
+		}
+	}
 }
 
 func (s *Scraper) pageReachedSinceBoundary(items []WeiboItem) bool {

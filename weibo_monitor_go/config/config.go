@@ -16,21 +16,23 @@ type Config struct {
 }
 
 type WeiboConfig struct {
-	TargetUID           string `yaml:"target_uid"`
-	SinceTime           string `yaml:"since_time"`
-	HistoryFile         string `yaml:"history_file"`
-	MediaDir            string `yaml:"media_dir"`
-	UserDataDir         string `yaml:"user_data_dir"`
-	CookieFile          string `yaml:"cookie_file"`
-	CookieString        string `yaml:"cookie_string"`
-	BrowserApp          string `yaml:"browser_app"`
-	BrowserChannel      string `yaml:"browser_channel"`
-	LoginURL            string `yaml:"login_url"`
-	LoginTimeoutSeconds int    `yaml:"login_timeout_seconds"`
-	LoginCheckInterval  int    `yaml:"login_check_interval_seconds"`
-	MaxPages            int    `yaml:"max_pages"`
-	PageIntervalSeconds int    `yaml:"page_interval_seconds"`
-	PollIntervalSeconds int    `yaml:"poll_interval_seconds"`
+	TargetUID              string `yaml:"target_uid"`
+	SinceTime              string `yaml:"since_time"`
+	StateFile              string `yaml:"state_file"`
+	HistoryFile            string `yaml:"history_file"`
+	MediaDir               string `yaml:"media_dir"`
+	UserDataDir            string `yaml:"user_data_dir"`
+	CookieFile             string `yaml:"cookie_file"`
+	CookieString           string `yaml:"cookie_string"`
+	BrowserApp             string `yaml:"browser_app"`
+	BrowserChannel         string `yaml:"browser_channel"`
+	LoginURL               string `yaml:"login_url"`
+	LoginTimeoutSeconds    int    `yaml:"login_timeout_seconds"`
+	LoginCheckInterval     int    `yaml:"login_check_interval_seconds"`
+	PlaywrightRefreshHours int    `yaml:"playwright_refresh_hours"`
+	MaxPages               int    `yaml:"max_pages"`
+	PageIntervalSeconds    int    `yaml:"page_interval_seconds"`
+	PollIntervalSeconds    int    `yaml:"poll_interval_seconds"`
 }
 
 type TelegramConfig struct {
@@ -80,6 +82,9 @@ func (c *Config) validate() error {
 	if c.Weibo.HistoryFile == "" {
 		c.Weibo.HistoryFile = "weibo_history.jsonl"
 	}
+	if c.Weibo.StateFile == "" {
+		c.Weibo.StateFile = "weibo_state.json"
+	}
 	if c.Weibo.MediaDir == "" {
 		c.Weibo.MediaDir = "media_downloads"
 	}
@@ -100,6 +105,9 @@ func (c *Config) validate() error {
 	}
 	if c.Weibo.LoginCheckInterval <= 0 {
 		c.Weibo.LoginCheckInterval = 5
+	}
+	if c.Weibo.PlaywrightRefreshHours <= 0 {
+		c.Weibo.PlaywrightRefreshHours = 6
 	}
 	if c.Weibo.MaxPages < 0 {
 		return fmt.Errorf("weibo.max_pages 不能小于 0")
@@ -129,6 +137,7 @@ func (c *Config) validate() error {
 
 func (c *Config) resolvePaths(baseDir string) {
 	c.Weibo.HistoryFile = resolvePath(baseDir, c.Weibo.HistoryFile)
+	c.Weibo.StateFile = resolvePath(baseDir, c.Weibo.StateFile)
 	c.Weibo.MediaDir = resolvePath(baseDir, c.Weibo.MediaDir)
 	c.Weibo.UserDataDir = resolvePath(baseDir, c.Weibo.UserDataDir)
 	c.Weibo.CookieFile = resolvePath(baseDir, c.Weibo.CookieFile)

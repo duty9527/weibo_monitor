@@ -1,0 +1,1 @@
+*/30 * * * * cd /home/duty/weibo_cron && ./weibo_monitor >> cron.log 2>&1

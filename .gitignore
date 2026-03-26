@@ -15,4 +15,5 @@ dashboard_data.json
 dashboard.html
 meta_query_result.json
 raw_image_msg.json
+weibo_monitor_go/weibo_monitor
 downloaded_screenshot*.png

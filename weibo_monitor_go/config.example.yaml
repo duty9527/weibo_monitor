@@ -4,6 +4,8 @@ weibo:
   # 增量抓取时间节点；只处理严格晚于该时间的微博
   # 支持: 2006-01-02 15:04:05 / 2006-01-02 / RFC3339
   since_time: "2026-01-01 00:00:00"
+  # 运行状态文件，保存最近抓取到的微博时间和最近一次 Playwright 刷新时间
+  state_file: "weibo_state.json"
   # 历史记录保存文件
   history_file: "weibo_history.jsonl"
   # 媒体文件下载目录
@@ -24,6 +26,8 @@ weibo:
   login_timeout_seconds: 180
   # 轮询 Cookie 是否生效的间隔秒数
   login_check_interval_seconds: 5
+  # 间隔多少小时主动调用一次 Playwright 持久化上下文刷新 Cookie
+  playwright_refresh_hours: 6
   # 爬取最大页数 (0 表示不限制)
   max_pages: 10
   # 翻页间隔（秒）
