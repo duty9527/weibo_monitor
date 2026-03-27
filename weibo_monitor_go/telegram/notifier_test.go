@@ -8,6 +8,7 @@ import (
 	"mime"
 	"mime/multipart"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -72,6 +73,20 @@ func TestFormatRecordMessageAddsSeparatorBeforeBracketAfterURL(t *testing.T) {
 
 	if !strings.Contains(got, "https://example.com/abc （附图）") {
 		t.Fatalf("expected bracket separator in message: %q", got)
+	}
+}
+
+func TestFormatRecordMessageIncludesSkippedMediaNotice(t *testing.T) {
+	record := &weibo.WeiboRecord{
+		CreatedAt:         "2026-03-26 18:22:52",
+		Text:              "转发内容",
+		SkippedMediaCount: 2,
+	}
+
+	got := formatRecordMessage(record)
+
+	if !strings.Contains(got, "提示：相关媒体已在前文中发送，本次跳过重复发送（2 个）") {
+		t.Fatalf("expected skipped media notice in message: %q", got)
 	}
 }
 
@@ -177,6 +192,85 @@ func TestSendMediaGroupSetsShowCaptionAboveMediaForAllItems(t *testing.T) {
 	}
 }
 
+func TestSendRecordWithoutFailedMediaDoesNotSendFallback(t *testing.T) {
+	t.Helper()
+
+	var texts []string
+	client := NewClient(config.TelegramConfig{
+		Enabled: true,
+		ChatID:  "123",
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	client.httpClient = &http.Client{
+		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			if r.URL.Path != "/bot/sendMessage" {
+				t.Fatalf("unexpected path: %s", r.URL.Path)
+			}
+			texts = append(texts, readFormField(t, r, "text"))
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader(`{"ok":true}`)),
+			}, nil
+		}),
+	}
+
+	record := &weibo.WeiboRecord{
+		Text:      "测试正文",
+		SourceURL: "https://weibo.com/detail/123",
+		MediaURLs: []string{"https://wx1.sinaimg.cn/mw2000/example.jpg"},
+	}
+
+	if err := client.SendRecord(context.Background(), record); err != nil {
+		t.Fatalf("SendRecord failed: %v", err)
+	}
+
+	if len(texts) != 1 {
+		t.Fatalf("expected 1 text message, got %d: %#v", len(texts), texts)
+	}
+	if strings.Contains(texts[0], "以下媒体未成功下载") {
+		t.Fatalf("unexpected fallback text: %q", texts[0])
+	}
+}
+
+func TestSendRecordUsesFailedMediaURLsForFallback(t *testing.T) {
+	t.Helper()
+
+	var texts []string
+	client := NewClient(config.TelegramConfig{
+		Enabled: true,
+		ChatID:  "123",
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	client.httpClient = &http.Client{
+		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			if r.URL.Path != "/bot/sendMessage" {
+				t.Fatalf("unexpected path: %s", r.URL.Path)
+			}
+			texts = append(texts, readFormField(t, r, "text"))
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader(`{"ok":true}`)),
+			}, nil
+		}),
+	}
+
+	record := &weibo.WeiboRecord{
+		Text:            "测试正文",
+		FailedMediaURLs: []string{"https://wx1.sinaimg.cn/mw2000/example.jpg"},
+	}
+
+	if err := client.SendRecord(context.Background(), record); err != nil {
+		t.Fatalf("SendRecord failed: %v", err)
+	}
+
+	if len(texts) != 2 {
+		t.Fatalf("expected 2 text messages, got %d: %#v", len(texts), texts)
+	}
+	if !strings.Contains(texts[1], record.FailedMediaURLs[0]) {
+		t.Fatalf("expected fallback to contain failed media URL, got %q", texts[1])
+	}
+}
+
 func readMultipartField(t *testing.T, r *http.Request, name string) string {
 	t.Helper()
 
@@ -211,6 +305,21 @@ func readMultipartField(t *testing.T, r *http.Request, name string) string {
 
 	t.Fatalf("multipart field %s not found", name)
 	return ""
+}
+
+func readFormField(t *testing.T, r *http.Request, name string) string {
+	t.Helper()
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		t.Fatalf("read form body: %v", err)
+	}
+
+	values, err := url.ParseQuery(string(body))
+	if err != nil {
+		t.Fatalf("parse form body: %v", err)
+	}
+	return values.Get(name)
 }
 
 type roundTripFunc func(*http.Request) (*http.Response, error)

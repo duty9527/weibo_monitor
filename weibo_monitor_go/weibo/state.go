@@ -10,8 +10,9 @@ import (
 )
 
 type RunState struct {
-	LastFetchedAt           string `json:"last_fetched_at"`
-	LastPlaywrightRefreshAt string `json:"last_playwright_refresh_at"`
+	LastFetchedAt           string          `json:"last_fetched_at"`
+	LastPlaywrightRefreshAt string          `json:"last_playwright_refresh_at"`
+	SentMedia               map[string]bool `json:"sent_media,omitempty"`
 }
 
 func LoadRunState(path string) (*RunState, error) {
@@ -79,6 +80,37 @@ func (s *RunState) SetLastPlaywrightRefreshTime(value time.Time) {
 		return
 	}
 	s.LastPlaywrightRefreshAt = value.In(time.Local).Format(time.RFC3339)
+}
+
+func (s *RunState) HasSentMedia(key string) bool {
+	if s == nil {
+		return false
+	}
+
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return false
+	}
+
+	return s.SentMedia[key]
+}
+
+func (s *RunState) MarkMediaSent(keys []string) {
+	if s == nil || len(keys) == 0 {
+		return
+	}
+
+	if s.SentMedia == nil {
+		s.SentMedia = make(map[string]bool, len(keys))
+	}
+
+	for _, key := range keys {
+		key = strings.TrimSpace(key)
+		if key == "" {
+			continue
+		}
+		s.SentMedia[key] = true
+	}
 }
 
 func parseStateTime(value string) (time.Time, bool) {

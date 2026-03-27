@@ -109,9 +109,36 @@ func executeOnce(
 
 	for _, record := range records {
 		if notifier.Enabled() {
-			logger.Info("推送微博到 Telegram", "id", record.ID)
-			if err := notifier.SendRecord(ctx, record); err != nil {
+			sendRecord, newMediaKeys, err := weibo.FilterSentMedia(record, state)
+			if err != nil {
+				return fmt.Errorf("过滤微博 %s 的已发送媒体失败: %w", record.ID, err)
+			}
+
+			skippedMediaCount := len(record.LocalMediaPaths) - len(sendRecord.LocalMediaPaths)
+			sendRecord.SkippedMediaCount = skippedMediaCount
+			if skippedMediaCount > 0 {
+				logger.Info(
+					"检测到已发送媒体，发送时跳过",
+					"id", record.ID,
+					"media_total", len(record.LocalMediaPaths),
+					"media_skipped", skippedMediaCount,
+				)
+			}
+
+			logger.Info(
+				"推送微博到 Telegram",
+				"id", record.ID,
+				"media_to_send", len(sendRecord.LocalMediaPaths),
+			)
+			if err := notifier.SendRecord(ctx, sendRecord); err != nil {
 				return fmt.Errorf("推送微博 %s 失败: %w", record.ID, err)
+			}
+
+			if len(newMediaKeys) > 0 {
+				state.MarkMediaSent(newMediaKeys)
+				if err := weibo.SaveRunState(cfg.Weibo.StateFile, state); err != nil {
+					logger.Warn("写入媒体发送状态失败", "id", record.ID, "err", err)
+				}
 			}
 		}
 

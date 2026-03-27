@@ -443,10 +443,13 @@ func (s *Scraper) FetchNewRecords(ctx context.Context) ([]*WeiboRecord, error) {
 		}
 
 		localPaths := make([]string, 0, len(mediaURLs))
+		failedMediaURLs := make([]string, 0)
 		for _, mediaURL := range mediaURLs {
 			if localPath := s.DownloadMedia(mediaURL); localPath != "" {
 				localPaths = append(localPaths, localPath)
+				continue
 			}
+			failedMediaURLs = append(failedMediaURLs, mediaURL)
 		}
 
 		record := &WeiboRecord{
@@ -457,6 +460,7 @@ func (s *Scraper) FetchNewRecords(ctx context.Context) ([]*WeiboRecord, error) {
 			MediaURLs:       mediaURLs,
 			LocalMediaPaths: uniqueStrings(localPaths),
 			IsRetweet:       isRetweet,
+			FailedMediaURLs: uniqueStrings(failedMediaURLs),
 		}
 
 		newRecords = append(newRecords, record)

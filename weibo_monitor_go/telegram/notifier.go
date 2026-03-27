@@ -83,8 +83,8 @@ func (c *Client) SendRecord(ctx context.Context, record *weibo.WeiboRecord) erro
 		if err := c.sendText(ctx, body, enablePreview); err != nil {
 			return err
 		}
-		if len(record.MediaURLs) > 0 {
-			fallback := "以下媒体未成功下载，原始链接如下：\n" + strings.Join(record.MediaURLs, "\n")
+		if len(record.FailedMediaURLs) > 0 {
+			fallback := "以下媒体未成功下载，原始链接如下：\n" + strings.Join(record.FailedMediaURLs, "\n")
 			return c.sendText(ctx, fallback, false)
 		}
 		return nil
@@ -105,8 +105,8 @@ func (c *Client) SendRecord(ctx context.Context, record *weibo.WeiboRecord) erro
 		}
 	}
 
-	if len(record.MediaURLs) > len(record.LocalMediaPaths) {
-		fallback := "部分媒体未成功下载，原始链接如下：\n" + strings.Join(record.MediaURLs, "\n")
+	if len(record.FailedMediaURLs) > 0 {
+		fallback := "部分媒体未成功下载，原始链接如下：\n" + strings.Join(record.FailedMediaURLs, "\n")
 		if err := c.sendText(ctx, fallback, false); err != nil {
 			return err
 		}
@@ -414,6 +414,13 @@ func formatRecordMessage(record *weibo.WeiboRecord) string {
 	text := strings.TrimSpace(record.Text)
 	if text != "" {
 		lines = append(lines, "", normalizeTelegramText(text))
+	}
+	if record.SkippedMediaCount > 0 {
+		lines = append(
+			lines,
+			"",
+			fmt.Sprintf("提示：相关媒体已在前文中发送，本次跳过重复发送（%d 个）", record.SkippedMediaCount),
+		)
 	}
 
 	sourceURL := strings.TrimSpace(record.SourceURL)
