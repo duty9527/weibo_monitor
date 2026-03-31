@@ -1,0 +1,29 @@
+weibo:
+  target_uid: "YOUR_TARGET_UID"
+  since_time: "2026-01-01 00:00:00"
+  state_file: "weibo_state.json"
+  history_file: "weibo_history.jsonl"
+  media_dir: "media_downloads"
+  user_data_dir: "../weibo_user_data"
+  cookie_file: ""
+  cookie_string: ""
+  browser_app: "Google Chrome"
+  browser_channel: "chrome"
+  login_url: ""
+  login_timeout_seconds: 180
+  login_check_interval_seconds: 5
+  playwright_refresh_hours: 6
+  max_pages: 10
+  page_interval_seconds: 2
+  poll_interval_seconds: 300
+
+telegram:
+  bot_token: "YOUR_BOT_TOKEN"
+  chat_id: "-1001234567890"
+  message_thread_id: 0
+  direct_messages_topic_id: 0
+  enabled: false
+  timeout_seconds: 30
+
+log:
+  level: "info"
