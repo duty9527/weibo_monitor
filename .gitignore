@@ -3,6 +3,7 @@
 
 # Local secrets and runtime state
 config.yaml
+config.groupchat.yaml
 weibo_user_data
 media_downloads
 # Generated data artifacts
