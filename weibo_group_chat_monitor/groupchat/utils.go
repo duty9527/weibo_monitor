@@ -96,6 +96,28 @@ func joinMediaPaths(paths []string) *string {
 	return &joined
 }
 
+func splitMediaPaths(value *string) []string {
+	if value == nil {
+		return nil
+	}
+
+	raw := strings.TrimSpace(*value)
+	if raw == "" {
+		return nil
+	}
+
+	parts := strings.Split(raw, ",")
+	result := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		result = append(result, part)
+	}
+	return uniqueStrings(result)
+}
+
 func matchesStopCondition(cond config.StopCondition, readableTime, sender, text string) bool {
 	if !cond.Enabled {
 		return false

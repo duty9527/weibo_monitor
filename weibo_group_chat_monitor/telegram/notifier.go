@@ -38,6 +38,7 @@ type Client struct {
 type apiResponse struct {
 	OK          bool   `json:"ok"`
 	Description string `json:"description"`
+	Result      any    `json:"result"`
 }
 
 type mediaItem struct {
@@ -51,6 +52,15 @@ type inputMedia struct {
 	Media                 string `json:"media"`
 	Caption               string `json:"caption,omitempty"`
 	ShowCaptionAboveMedia bool   `json:"show_caption_above_media,omitempty"`
+}
+
+type GroupChatSummaryEntry struct {
+	Text       string
+	MediaPaths []string
+}
+
+type telegramMessage struct {
+	MessageID int `json:"message_id"`
 }
 
 // NewClient 创建 Telegram 客户端。
@@ -75,6 +85,155 @@ func (c *Client) SendText(ctx context.Context, text string) error {
 		return nil
 	}
 	return c.sendText(ctx, text, false)
+}
+
+// SendGroupChatSummary 发送群聊摘要及其关联媒体。
+func (c *Client) SendGroupChatSummary(ctx context.Context, header string, entries []GroupChatSummaryEntry) error {
+	if !c.cfg.Enabled {
+		return nil
+	}
+
+	blocks := buildGroupChatSummaryBlocks(header, entries, c.estimatedMediaLinkLength())
+	for _, block := range blocks {
+		if err := c.sendGroupChatSummaryBlock(ctx, block); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+type groupChatSummaryBlock struct {
+	Lines   []string
+	Entries []GroupChatSummaryEntry
+}
+
+func buildGroupChatSummaryBlocks(header string, entries []GroupChatSummaryEntry, estimatedLinkLength int) []groupChatSummaryBlock {
+	lines := make([]string, 0, len(entries)+1)
+	blockEntries := make([]GroupChatSummaryEntry, 0, len(entries))
+	blocks := make([]groupChatSummaryBlock, 0, 1)
+	currentLength := 0
+
+	appendLine := func(entry GroupChatSummaryEntry, line string, lineLength int) {
+		lines = append(lines, line)
+		blockEntries = append(blockEntries, entry)
+		if currentLength == 0 {
+			currentLength = lineLength
+		} else {
+			currentLength += 1 + lineLength
+		}
+	}
+
+	flush := func() {
+		if len(lines) == 0 {
+			return
+		}
+		copiedLines := append([]string(nil), lines...)
+		copiedEntries := append([]GroupChatSummaryEntry(nil), blockEntries...)
+		blocks = append(blocks, groupChatSummaryBlock{
+			Lines:   copiedLines,
+			Entries: copiedEntries,
+		})
+		lines = lines[:0]
+		blockEntries = blockEntries[:0]
+		currentLength = 0
+	}
+
+	if header = strings.TrimSpace(header); header != "" {
+		headerEntry := GroupChatSummaryEntry{Text: header}
+		appendLine(headerEntry, header, len([]rune(header)))
+	}
+
+	for _, entry := range entries {
+		line := strings.TrimSpace(entry.Text)
+		if line == "" {
+			continue
+		}
+		lineLength := len([]rune(line)) + len(buildExistingMediaItems(entry.MediaPaths, nil))*estimatedLinkLength
+		if currentLength > 0 && currentLength+1+lineLength > captionLimit {
+			flush()
+		}
+		appendLine(entry, line, lineLength)
+	}
+
+	flush()
+	return blocks
+}
+
+func (c *Client) sendGroupChatSummaryBlock(ctx context.Context, block groupChatSummaryBlock) error {
+	if len(block.Lines) == 0 {
+		return nil
+	}
+
+	mediaRefs := make(map[int][]string)
+	mediaMessageID := 0
+	for idx, entry := range block.Entries {
+		items := buildExistingMediaItems(entry.MediaPaths, c.logger)
+		if len(items) == 0 {
+			continue
+		}
+
+		links, firstMessageID, err := c.sendGroupChatSummaryEntryMedia(ctx, items)
+		if err != nil {
+			return err
+		}
+		if mediaMessageID == 0 {
+			mediaMessageID = firstMessageID
+		}
+		mediaRefs[idx] = links
+	}
+
+	rendered := renderGroupChatSummaryBlockText(block, mediaRefs)
+	if mediaMessageID == 0 {
+		return c.sendText(ctx, rendered, false)
+	}
+
+	chunks := splitText(rendered, captionLimit)
+	if len(chunks) == 0 {
+		return nil
+	}
+	for _, chunk := range chunks[:len(chunks)-1] {
+		if err := c.sendText(ctx, chunk, false); err != nil {
+			return err
+		}
+	}
+	return c.editMessageCaption(ctx, mediaMessageID, chunks[len(chunks)-1])
+}
+
+func (c *Client) sendGroupChatSummaryEntryMedia(ctx context.Context, items []mediaItem) ([]string, int, error) {
+	links := make([]string, 0, len(items))
+	firstMessageID := 0
+	for _, item := range items {
+		messageID, err := c.sendSingleMediaWithMessageID(ctx, item, "")
+		if err != nil {
+			return nil, 0, err
+		}
+		if firstMessageID == 0 {
+			firstMessageID = messageID
+		}
+		links = append(links, c.messageLink(messageID))
+	}
+	return links, firstMessageID, nil
+}
+
+func renderGroupChatSummaryBlockText(block groupChatSummaryBlock, mediaRefs map[int][]string) string {
+	lines := make([]string, 0, len(block.Lines))
+	for idx, line := range block.Lines {
+		refs := mediaRefs[idx]
+		if len(refs) == 0 {
+			lines = append(lines, line)
+			continue
+		}
+		lines = append(lines, line+" "+strings.Join(refs, " "))
+	}
+	return strings.TrimSpace(strings.Join(lines, "\n"))
+}
+
+func (c *Client) estimatedMediaLinkLength() int {
+	chatPart := strings.TrimPrefix(strings.TrimSpace(c.cfg.ChatID), "-100")
+	if chatPart == "" {
+		chatPart = "1234567890123"
+	}
+	return len([]rune(" https://t.me/c/" + chatPart + "/123456"))
 }
 
 // SendRecord 将一条微博发送到指定的 chat / topic。
@@ -163,7 +322,8 @@ func (c *Client) sendTextChunk(ctx context.Context, text string, enablePreview b
 	}
 	defer resp.Body.Close()
 
-	return parseAPIResponse("sendMessage", resp)
+	_, err = parseAPIResponse("sendMessage", resp)
+	return err
 }
 
 func (c *Client) sendMediaSet(ctx context.Context, items []mediaItem, caption string) error {
@@ -209,9 +369,14 @@ func (c *Client) sendMediaSet(ctx context.Context, items []mediaItem, caption st
 }
 
 func (c *Client) sendSingleMedia(ctx context.Context, item mediaItem, caption string) error {
+	_, err := c.sendSingleMediaWithMessageID(ctx, item, caption)
+	return err
+}
+
+func (c *Client) sendSingleMediaWithMessageID(ctx context.Context, item mediaItem, caption string) (int, error) {
 	file, err := os.Open(item.Path)
 	if err != nil {
-		return fmt.Errorf("打开媒体文件失败: %w", err)
+		return 0, fmt.Errorf("打开媒体文件失败: %w", err)
 	}
 	defer file.Close()
 
@@ -221,46 +386,50 @@ func (c *Client) sendSingleMedia(ctx context.Context, item mediaItem, caption st
 	writer := multipart.NewWriter(&body)
 
 	if err := writer.WriteField("chat_id", c.cfg.ChatID); err != nil {
-		return err
+		return 0, err
 	}
 	if err := c.applyThreadWriter(writer); err != nil {
-		return err
+		return 0, err
 	}
 	if caption = strings.TrimSpace(caption); caption != "" {
 		if err := writer.WriteField("caption", caption); err != nil {
-			return err
+			return 0, err
 		}
 		if item.Type == "photo" || item.Type == "video" {
 			if err := writer.WriteField("show_caption_above_media", "true"); err != nil {
-				return err
+				return 0, err
 			}
 		}
 	}
 
 	part, err := writer.CreateFormFile(item.Field, filepath.Base(item.Path))
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if _, err := io.Copy(part, file); err != nil {
-		return err
+		return 0, err
 	}
 	if err := writer.Close(); err != nil {
-		return err
+		return 0, err
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.apiURL(method), &body)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("发送 Telegram 媒体失败: %w", err)
+		return 0, fmt.Errorf("发送 Telegram 媒体失败: %w", err)
 	}
 	defer resp.Body.Close()
 
-	return parseAPIResponse(method, resp)
+	result, err := parseAPIResponse(method, resp)
+	if err != nil {
+		return 0, err
+	}
+	return result.MessageID, nil
 }
 
 func (c *Client) sendMediaGroup(ctx context.Context, items []mediaItem, caption string) error {
@@ -333,7 +502,8 @@ func (c *Client) sendMediaGroup(ctx context.Context, items []mediaItem, caption 
 	}
 	defer resp.Body.Close()
 
-	return parseAPIResponse("sendMediaGroup", resp)
+	_, err = parseAPIResponse("sendMediaGroup", resp)
+	return err
 }
 
 func (c *Client) applyThreadValues(values url.Values) {
@@ -363,9 +533,69 @@ func (c *Client) apiURL(method string) string {
 	return fmt.Sprintf("https://api.telegram.org/bot%s/%s", c.cfg.BotToken, method)
 }
 
+func (c *Client) editMessageCaption(ctx context.Context, messageID int, caption string) error {
+	values := url.Values{}
+	values.Set("chat_id", c.cfg.ChatID)
+	values.Set("message_id", strconv.Itoa(messageID))
+	values.Set("caption", strings.TrimSpace(caption))
+	values.Set("show_caption_above_media", "true")
+	c.applyThreadValues(values)
+
+	req, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodPost,
+		c.apiURL("editMessageCaption"),
+		strings.NewReader(values.Encode()),
+	)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("编辑 Telegram caption 失败: %w", err)
+	}
+	defer resp.Body.Close()
+
+	_, err = parseAPIResponse("editMessageCaption", resp)
+	return err
+}
+
+func (c *Client) messageLink(messageID int) string {
+	chatID := strings.TrimSpace(c.cfg.ChatID)
+	if strings.HasPrefix(chatID, "-100") && messageID > 0 {
+		return fmt.Sprintf("https://t.me/c/%s/%d", strings.TrimPrefix(chatID, "-100"), messageID)
+	}
+	return fmt.Sprintf("#media-%d", messageID)
+}
+
 func buildMediaItems(paths []string) []mediaItem {
 	items := make([]mediaItem, 0, len(paths))
 	for _, path := range paths {
+		itemType, field := detectMediaKind(path)
+		items = append(items, mediaItem{
+			Path:  path,
+			Type:  itemType,
+			Field: field,
+		})
+	}
+	return items
+}
+
+func buildExistingMediaItems(paths []string, logger *slog.Logger) []mediaItem {
+	items := make([]mediaItem, 0, len(paths))
+	for _, path := range paths {
+		path = strings.TrimSpace(path)
+		if path == "" {
+			continue
+		}
+		if _, err := os.Stat(path); err != nil {
+			if logger != nil {
+				logger.Warn("跳过不存在的 Telegram 媒体文件", "path", path, "err", err)
+			}
+			continue
+		}
 		itemType, field := detectMediaKind(path)
 		items = append(items, mediaItem{
 			Path:  path,
@@ -573,21 +803,41 @@ func splitText(text string, limit int) []string {
 	return chunks
 }
 
-func parseAPIResponse(method string, resp *http.Response) error {
+func parseAPIResponse(method string, resp *http.Response) (*telegramMessage, error) {
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("%s 返回 HTTP %d: %s", method, resp.StatusCode, strings.TrimSpace(string(body)))
+		return nil, fmt.Errorf("%s 返回 HTTP %d: %s", method, resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 
 	var result apiResponse
 	if len(body) == 0 {
-		return nil
+		return &telegramMessage{}, nil
 	}
 	if err := json.Unmarshal(body, &result); err != nil {
-		return nil
+		return &telegramMessage{}, nil
 	}
 	if !result.OK {
-		return fmt.Errorf("%s 返回失败: %s", method, result.Description)
+		return nil, fmt.Errorf("%s 返回失败: %s", method, result.Description)
 	}
-	return nil
+
+	msg := &telegramMessage{}
+	if result.Result == nil {
+		return msg, nil
+	}
+
+	switch typed := result.Result.(type) {
+	case map[string]any:
+		if value, ok := typed["message_id"].(float64); ok {
+			msg.MessageID = int(value)
+		}
+	case []any:
+		if len(typed) > 0 {
+			if first, ok := typed[0].(map[string]any); ok {
+				if value, ok := first["message_id"].(float64); ok {
+					msg.MessageID = int(value)
+				}
+			}
+		}
+	}
+	return msg, nil
 }

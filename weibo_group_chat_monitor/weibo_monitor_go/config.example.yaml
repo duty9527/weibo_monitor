@@ -1,0 +1,54 @@
+weibo:
+  # 目标微博用户的 UID
+  target_uid: "YOUR_TARGET_UID"
+  # 增量抓取时间节点；只处理严格晚于该时间的微博
+  # 支持: 2006-01-02 15:04:05 / 2006-01-02 / RFC3339
+  since_time: "2026-01-01 00:00:00"
+  # 运行状态文件，保存最近抓取到的微博时间和最近一次 Playwright 刷新时间
+  state_file: "weibo_state.json"
+  # 历史记录保存文件
+  history_file: "weibo_history.jsonl"
+  # 媒体文件下载目录
+  media_dir: "media_downloads"
+  # 浏览器用户数据目录 (用于获取 Cookie)
+  user_data_dir: "../weibo_user_data"
+  # 可选：显式指定 Netscape cookies.txt 文件，优先级高于 user_data_dir
+  cookie_file: ""
+  # 可选：直接提供完整 Cookie 字符串，优先级最高
+  cookie_string: ""
+  # 读取不到 Cookie 时，用哪个 Chromium 系浏览器拉起登录
+  browser_app: "Google Chrome"
+  # Playwright 使用的浏览器 channel，可选: chrome / chromium / msedge
+  browser_channel: "chrome"
+  # 自动拉起浏览器时访问的地址；留空时默认打开目标用户主页
+  login_url: ""
+  # 自动拉起浏览器后，最多等待登录完成的秒数
+  login_timeout_seconds: 180
+  # 轮询 Cookie 是否生效的间隔秒数
+  login_check_interval_seconds: 5
+  # 间隔多少小时主动调用一次 Playwright 持久化上下文刷新 Cookie
+  playwright_refresh_hours: 6
+  # 爬取最大页数 (0 表示不限制)
+  max_pages: 10
+  # 翻页间隔（秒）
+  page_interval_seconds: 2
+  # 监控模式：轮询间隔（秒），0 表示只运行一次
+  poll_interval_seconds: 300
+
+telegram:
+  # Telegram Bot Token
+  bot_token: "YOUR_BOT_TOKEN"
+  # 发送消息的 Chat ID（群组或频道）
+  chat_id: "-1001234567890"
+  # forum 超级群 topic ID；如果不是 forum topic 则设为 0
+  message_thread_id: 0
+  # 频道 Direct Messages topic ID；普通群组/频道推送时设为 0
+  direct_messages_topic_id: 0
+  # 是否启用 Telegram 通知
+  enabled: false
+  # 连接超时（秒）
+  timeout_seconds: 30
+
+log:
+  # 日志级别: debug, info, warn, error
+  level: "info"
