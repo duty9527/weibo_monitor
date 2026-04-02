@@ -11,3 +11,4 @@ media_downloads
 *.json
 weibo_monitor_go/weibo_monitor
 *.png
+__pycache__

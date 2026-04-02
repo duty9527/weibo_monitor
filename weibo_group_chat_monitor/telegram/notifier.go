@@ -93,7 +93,7 @@ func (c *Client) SendGroupChatSummary(ctx context.Context, header string, entrie
 		return nil
 	}
 
-	blocks := buildGroupChatSummaryBlocks(header, entries, c.estimatedMediaLinkLength())
+	blocks := buildGroupChatSummaryBlocks(header, entries)
 	for _, block := range blocks {
 		if err := c.sendGroupChatSummaryBlock(ctx, block); err != nil {
 			return err
@@ -107,7 +107,12 @@ type groupChatSummaryBlock struct {
 	Entries []GroupChatSummaryEntry
 }
 
-func buildGroupChatSummaryBlocks(header string, entries []GroupChatSummaryEntry, estimatedLinkLength int) []groupChatSummaryBlock {
+type renderedSummaryLine struct {
+	Markdown      string
+	VisibleLength int
+}
+
+func buildGroupChatSummaryBlocks(header string, entries []GroupChatSummaryEntry) []groupChatSummaryBlock {
 	lines := make([]string, 0, len(entries)+1)
 	blockEntries := make([]GroupChatSummaryEntry, 0, len(entries))
 	blocks := make([]groupChatSummaryBlock, 0, 1)
@@ -148,7 +153,7 @@ func buildGroupChatSummaryBlocks(header string, entries []GroupChatSummaryEntry,
 		if line == "" {
 			continue
 		}
-		lineLength := len([]rune(line)) + len(buildExistingMediaItems(entry.MediaPaths, nil))*estimatedLinkLength
+		lineLength := visibleGroupChatSummaryLineLength(line, len(buildExistingMediaItems(entry.MediaPaths, nil)))
 		if currentLength > 0 && currentLength+1+lineLength > captionLimit {
 			flush()
 		}
@@ -187,16 +192,17 @@ func (c *Client) sendGroupChatSummaryBlock(ctx context.Context, block groupChatS
 		return c.sendText(ctx, rendered, false)
 	}
 
-	chunks := splitText(rendered, captionLimit)
-	if len(chunks) == 0 {
-		return nil
-	}
-	for _, chunk := range chunks[:len(chunks)-1] {
-		if err := c.sendText(ctx, chunk, false); err != nil {
+	renderedLines := buildRenderedGroupChatSummaryLines(block, mediaRefs, captionLimit)
+	textChunks, caption := splitRenderedSummaryDelivery(renderedLines, captionLimit, textLimit)
+	for _, chunk := range textChunks {
+		if err := c.sendMarkdownText(ctx, chunk); err != nil {
 			return err
 		}
 	}
-	return c.editMessageCaption(ctx, mediaMessageID, chunks[len(chunks)-1])
+	if strings.TrimSpace(caption) == "" {
+		return nil
+	}
+	return c.editMessageCaptionMarkdown(ctx, mediaMessageID, caption)
 }
 
 func (c *Client) sendGroupChatSummaryEntryMedia(ctx context.Context, items []mediaItem) ([]string, int, error) {
@@ -223,17 +229,204 @@ func renderGroupChatSummaryBlockText(block groupChatSummaryBlock, mediaRefs map[
 			lines = append(lines, line)
 			continue
 		}
-		lines = append(lines, line+" "+strings.Join(refs, " "))
+		lines = append(lines, renderGroupChatSummaryLine(line, refs))
 	}
 	return strings.TrimSpace(strings.Join(lines, "\n"))
 }
 
-func (c *Client) estimatedMediaLinkLength() int {
-	chatPart := strings.TrimPrefix(strings.TrimSpace(c.cfg.ChatID), "-100")
-	if chatPart == "" {
-		chatPart = "1234567890123"
+func renderGroupChatSummaryLine(line string, refs []string) string {
+	line = strings.TrimSpace(line)
+	if len(refs) == 0 {
+		return line
 	}
-	return len([]rune(" https://t.me/c/" + chatPart + "/123456"))
+
+	parts := make([]string, 0, len(refs)+1)
+	if line != "" {
+		parts = append(parts, line)
+	}
+	parts = append(parts, refs[0])
+	for idx, ref := range refs[1:] {
+		parts = append(parts, fmt.Sprintf("媒体%d: %s", idx+2, ref))
+	}
+	return strings.Join(parts, " ")
+}
+
+func renderGroupChatSummaryLineMarkdown(line string, refs []string) string {
+	line = strings.TrimSpace(line)
+	if len(refs) == 0 {
+		return escapeTelegramMarkdownV2(line)
+	}
+
+	lines := strings.Split(line, " ")
+	time := ""
+	text := ""
+	if len(lines) > 1 {
+		time = lines[0]
+		text = strings.Join(lines[1:], " ")
+	}
+	parts := []string{fmt.Sprintf("%s [%s](%s)", time, escapeTelegramMarkdownV2(text), refs[0])}
+	for idx, ref := range refs[1:] {
+		parts = append(parts, fmt.Sprintf("[%s](%s)", escapeTelegramMarkdownV2(fmt.Sprintf("媒体%d", idx+2)), ref))
+	}
+	return strings.Join(parts, " ")
+}
+
+func buildRenderedGroupChatSummaryLines(block groupChatSummaryBlock, mediaRefs map[int][]string, limit int) []renderedSummaryLine {
+	lines := make([]renderedSummaryLine, 0, len(block.Lines))
+	for idx, line := range block.Lines {
+		lines = append(lines, splitRenderedGroupChatSummaryLine(line, mediaRefs[idx], limit)...)
+	}
+	return lines
+}
+
+func splitRenderedGroupChatSummaryLine(line string, refs []string, limit int) []renderedSummaryLine {
+	line = strings.TrimSpace(line)
+	if line == "" && len(refs) == 0 {
+		return nil
+	}
+
+	visibleLength := visibleGroupChatSummaryLineLength(line, len(refs))
+	if visibleLength <= limit {
+		return []renderedSummaryLine{{
+			Markdown:      renderGroupChatSummaryLineMarkdown(line, refs),
+			VisibleLength: visibleLength,
+		}}
+	}
+
+	runes := []rune(line)
+	if len(runes) == 0 {
+		return nil
+	}
+
+	if len(refs) == 0 {
+		chunks := make([]renderedSummaryLine, 0, (len(runes)+limit-1)/limit)
+		for len(runes) > 0 {
+			cut := min(len(runes), limit)
+			chunk := string(runes[:cut])
+			runes = runes[cut:]
+			chunk = strings.TrimSpace(chunk)
+			if chunk == "" {
+				continue
+			}
+			chunks = append(chunks, renderedSummaryLine{
+				Markdown:      escapeTelegramMarkdownV2(chunk),
+				VisibleLength: len([]rune(chunk)),
+			})
+		}
+		return chunks
+	}
+
+	allowedTextLength := limit - visibleGroupChatSummaryExtraLabelLength(len(refs))
+	if allowedTextLength <= 0 {
+		allowedTextLength = 1
+	}
+	if len(runes) <= allowedTextLength {
+		return []renderedSummaryLine{{
+			Markdown:      renderGroupChatSummaryLineMarkdown(line, refs),
+			VisibleLength: visibleLength,
+		}}
+	}
+
+	splitAt := len(runes) - allowedTextLength
+	prefix := string(runes[:splitAt])
+	suffix := string(runes[splitAt:])
+
+	result := splitRenderedGroupChatSummaryLine(prefix, nil, limit)
+	suffix = strings.TrimSpace(suffix)
+	if suffix != "" {
+		result = append(result, renderedSummaryLine{
+			Markdown:      renderGroupChatSummaryLineMarkdown(suffix, refs),
+			VisibleLength: visibleGroupChatSummaryLineLength(suffix, len(refs)),
+		})
+	}
+	return result
+}
+
+func splitRenderedSummaryDelivery(lines []renderedSummaryLine, captionLineLimit, textLineLimit int) ([]string, string) {
+	if len(lines) == 0 {
+		return nil, ""
+	}
+
+	captionStart := len(lines)
+	total := 0
+	for i := len(lines) - 1; i >= 0; i-- {
+		addition := lines[i].VisibleLength
+		if total > 0 {
+			addition++
+		}
+		if total > 0 && total+addition > captionLineLimit {
+			break
+		}
+		if total == 0 {
+			total = lines[i].VisibleLength
+		} else {
+			total += addition
+		}
+		captionStart = i
+	}
+
+	textChunks := packRenderedSummaryLines(lines[:captionStart], textLineLimit)
+	caption := joinRenderedSummaryLines(lines[captionStart:])
+	return textChunks, caption
+}
+
+func packRenderedSummaryLines(lines []renderedSummaryLine, limit int) []string {
+	if len(lines) == 0 {
+		return nil
+	}
+
+	chunks := make([]string, 0, 1)
+	start := 0
+	currentLength := 0
+	for idx, line := range lines {
+		addition := line.VisibleLength
+		if currentLength > 0 {
+			addition++
+		}
+		if currentLength > 0 && currentLength+addition > limit {
+			chunks = append(chunks, joinRenderedSummaryLines(lines[start:idx]))
+			start = idx
+			currentLength = line.VisibleLength
+			continue
+		}
+		if currentLength == 0 {
+			currentLength = line.VisibleLength
+		} else {
+			currentLength += addition
+		}
+	}
+	chunks = append(chunks, joinRenderedSummaryLines(lines[start:]))
+	return chunks
+}
+
+func joinRenderedSummaryLines(lines []renderedSummaryLine) string {
+	if len(lines) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(lines))
+	for _, line := range lines {
+		if strings.TrimSpace(line.Markdown) == "" {
+			continue
+		}
+		parts = append(parts, line.Markdown)
+	}
+	return strings.TrimSpace(strings.Join(parts, "\n"))
+}
+
+func visibleGroupChatSummaryLineLength(line string, mediaCount int) int {
+	length := len([]rune(strings.TrimSpace(line)))
+	return length + visibleGroupChatSummaryExtraLabelLength(mediaCount)
+}
+
+func visibleGroupChatSummaryExtraLabelLength(mediaCount int) int {
+	if mediaCount <= 1 {
+		return 0
+	}
+	total := 0
+	for i := 2; i <= mediaCount; i++ {
+		total += 1 + len([]rune(fmt.Sprintf("媒体%d", i)))
+	}
+	return total
 }
 
 // SendRecord 将一条微博发送到指定的 chat / topic。
@@ -326,6 +519,40 @@ func (c *Client) sendTextChunk(ctx context.Context, text string, enablePreview b
 	return err
 }
 
+func (c *Client) sendMarkdownText(ctx context.Context, text string) error {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return nil
+	}
+
+	values := url.Values{}
+	values.Set("chat_id", c.cfg.ChatID)
+	values.Set("text", text)
+	values.Set("parse_mode", "MarkdownV2")
+	values.Set("disable_web_page_preview", "true")
+	c.applyThreadValues(values)
+
+	req, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodPost,
+		c.apiURL("sendMessage"),
+		strings.NewReader(values.Encode()),
+	)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("发送 Telegram Markdown 文本消息失败: %w", err)
+	}
+	defer resp.Body.Close()
+
+	_, err = parseAPIResponse("sendMessage", resp)
+	return err
+}
+
 func (c *Client) sendMediaSet(ctx context.Context, items []mediaItem, caption string) error {
 	if len(items) == 0 {
 		return nil
@@ -374,13 +601,19 @@ func (c *Client) sendSingleMedia(ctx context.Context, item mediaItem, caption st
 }
 
 func (c *Client) sendSingleMediaWithMessageID(ctx context.Context, item mediaItem, caption string) (int, error) {
+	return c.sendSingleMediaWithMessageIDAs(ctx, item, caption, item.Type)
+}
+
+// sendSingleMediaWithMessageIDAs 使用指定的 mediaType 发送（用于降级为 document）。
+func (c *Client) sendSingleMediaWithMessageIDAs(ctx context.Context, item mediaItem, caption string, mediaType string) (int, error) {
 	file, err := os.Open(item.Path)
 	if err != nil {
 		return 0, fmt.Errorf("打开媒体文件失败: %w", err)
 	}
 	defer file.Close()
 
-	method := singleMediaMethod(item.Type)
+	method := singleMediaMethod(mediaType)
+	field := mediaType // sendPhoto -> field="photo", sendDocument -> field="document"
 
 	var body bytes.Buffer
 	writer := multipart.NewWriter(&body)
@@ -395,14 +628,14 @@ func (c *Client) sendSingleMediaWithMessageID(ctx context.Context, item mediaIte
 		if err := writer.WriteField("caption", caption); err != nil {
 			return 0, err
 		}
-		if item.Type == "photo" || item.Type == "video" {
+		if mediaType == "photo" || mediaType == "video" {
 			if err := writer.WriteField("show_caption_above_media", "true"); err != nil {
 				return 0, err
 			}
 		}
 	}
 
-	part, err := writer.CreateFormFile(item.Field, filepath.Base(item.Path))
+	part, err := writer.CreateFormFile(field, filepath.Base(item.Path))
 	if err != nil {
 		return 0, err
 	}
@@ -427,6 +660,16 @@ func (c *Client) sendSingleMediaWithMessageID(ctx context.Context, item mediaIte
 
 	result, err := parseAPIResponse(method, resp)
 	if err != nil {
+		// 图片/视频尺寸或格式不合法时，自动降级为 sendDocument 重试
+		if mediaType != "document" && isTelegramMediaInvalidError(err) {
+			c.logger.Warn("媒体格式被 Telegram 拒绝，降级为 sendDocument 重试",
+				"method", method,
+				"file", filepath.Base(item.Path),
+				"reason", err.Error(),
+			)
+			docItem := mediaItem{Path: item.Path, Type: "document", Field: "document"}
+			return c.sendSingleMediaWithMessageIDAs(ctx, docItem, caption, "document")
+		}
 		return 0, err
 	}
 	return result.MessageID, nil
@@ -502,8 +745,31 @@ func (c *Client) sendMediaGroup(ctx context.Context, items []mediaItem, caption 
 	}
 	defer resp.Body.Close()
 
-	_, err = parseAPIResponse("sendMediaGroup", resp)
-	return err
+	_, groupErr := parseAPIResponse("sendMediaGroup", resp)
+	if groupErr != nil {
+		// 媒体组中有不合法的图片/视频时，整组回退为逐个 sendDocument
+		if isTelegramMediaInvalidError(groupErr) {
+			c.logger.Warn("sendMediaGroup 被 Telegram 拒绝，回退为逐个 sendDocument 发送",
+				"count", len(items),
+				"reason", groupErr.Error(),
+			)
+			captionUsed := false
+			for _, item := range items {
+				itemCaption := ""
+				if !captionUsed {
+					itemCaption = caption
+					captionUsed = true
+				}
+				docItem := mediaItem{Path: item.Path, Type: "document", Field: "document"}
+				if _, err := c.sendSingleMediaWithMessageIDAs(ctx, docItem, itemCaption, "document"); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+		return groupErr
+	}
+	return nil
 }
 
 func (c *Client) applyThreadValues(values url.Values) {
@@ -555,6 +821,36 @@ func (c *Client) editMessageCaption(ctx context.Context, messageID int, caption 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("编辑 Telegram caption 失败: %w", err)
+	}
+	defer resp.Body.Close()
+
+	_, err = parseAPIResponse("editMessageCaption", resp)
+	return err
+}
+
+func (c *Client) editMessageCaptionMarkdown(ctx context.Context, messageID int, caption string) error {
+	values := url.Values{}
+	values.Set("chat_id", c.cfg.ChatID)
+	values.Set("message_id", strconv.Itoa(messageID))
+	values.Set("caption", strings.TrimSpace(caption))
+	values.Set("parse_mode", "MarkdownV2")
+	values.Set("show_caption_above_media", "true")
+	c.applyThreadValues(values)
+
+	req, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodPost,
+		c.apiURL("editMessageCaption"),
+		strings.NewReader(values.Encode()),
+	)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("编辑 Telegram Markdown caption 失败: %w", err)
 	}
 	defer resp.Body.Close()
 
@@ -670,6 +966,18 @@ func formatRecordMessage(record *weibo.WeiboRecord) string {
 		return "微博更新"
 	}
 	return strings.TrimSpace(strings.Join(lines, "\n"))
+}
+
+func escapeTelegramMarkdownV2(text string) string {
+	var builder strings.Builder
+	for _, r := range text {
+		switch r {
+		case '_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!', '\\':
+			builder.WriteByte('\\')
+		}
+		builder.WriteRune(r)
+	}
+	return builder.String()
 }
 
 func normalizeTelegramText(text string) string {
@@ -840,4 +1148,26 @@ func parseAPIResponse(method string, resp *http.Response) (*telegramMessage, err
 		}
 	}
 	return msg, nil
+}
+
+// isTelegramMediaInvalidError 判断 Telegram 返回的错误是否属于媒体格式/尺寸不合法，
+// 与 Python 版本中的降级触发条件保持一致。
+func isTelegramMediaInvalidError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	for _, kw := range []string{
+		"PHOTO_INVALID_DIMENSIONS",
+		"PHOTO_SAVE_FILE_INVALID",
+		"VIDEO_FILE_INVALID",
+		"failed to get HTTP URL content",
+		"Wrong type of the web page content",
+		"IMAGE_PROCESS_FAILED",
+	} {
+		if strings.Contains(msg, kw) {
+			return true
+		}
+	}
+	return false
 }

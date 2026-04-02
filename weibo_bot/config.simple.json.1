@@ -1,0 +1,29 @@
+{
+  "app": {
+    "max_concurrent_scrapes": 2
+  },
+  "telegram": {
+    "bot_token": "",
+    "api_base": "https://api.telegram.org",
+    "poll_timeout_seconds": 30,
+    "allowed_chat_ids": []
+  },
+  "weibo": {
+    "cookie": "",
+    "cookie_file": "",
+    "cookie_source": "playwright",
+    "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "referer": "https://weibo.com/",
+    "request_timeout_seconds": 20,
+    "media_download_timeout_seconds": 60,
+    "download_media": true,
+    "download_dir": "media_downloads",
+    "save_record": true,
+    "save_record_dir": "weibo_records",
+    "user_data_dir": "/Users/duty/perminal/weibo_chat_monitor/weibo_user_data",
+    "playwright_headless": true,
+    "cookie_warmup_url": "https://weibo.com/",
+    "cookie_wait_millis": 2000,
+    "playwright_timeout_seconds": 30
+  }
+}

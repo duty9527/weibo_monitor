@@ -39,14 +39,25 @@
 - 当块内摘要文本超出 `caption` 限制时，超出的前半部分会先作为普通文本消息发送，最后一段再写入媒体 caption
 - 当本地媒体文件缺失时，该条会退化为纯文本摘要，不会阻断整批摘要发送
 
-### 5. 停止条件
+### 5. 本地历史筛选与 Telegram 推送
+
+- 已新增独立运行模式 `groupchat-history`
+- 该模式不会启动浏览器抓取，只读取本地聊天记录历史
+- 支持读取按天输出的 `YYYY-MM-DD.jsonl` 历史目录
+- 也兼容读取旧的单文件历史格式
+- 支持按 `filters.target_senders` 过滤指定 sender 的历史消息
+- 支持通过 `local_history_push.start_date` / `end_date` 限定日期范围
+- 支持通过 `local_history_push.max_records` 仅推送最近命中的若干条
+- 命中的历史记录会沿用现有群聊摘要与媒体同步链路推送到 Telegram
+
+### 6. 停止条件
 
 - 增加了基于时间的停止条件 `stop_condition.target_time`
 - 当配置为 `YYYY-MM-DD HH:MM:SS` 时，消息时间小于等于该时间即停止
 - 当配置为 `YYYY-MM-DD` 时，按该日期 `00:00:00` 处理
 - 已修复批次内停止逻辑，命中停止边界后不会继续把更早的消息写入结果
 
-### 6. 媒体下载
+### 7. 媒体下载
 
 - 图片或附件下载支持三层回退：
 - 响应监听下载
@@ -55,12 +66,12 @@
 - 当前只有在三层都失败时，才会把失败消息写入失败记录文件
 - 如果前两层失败但第三层成功，现在会打印明确的成功日志
 
-### 7. 失败消息原始 JSON 保存
+### 8. 失败消息原始 JSON 保存
 
 - 已支持在媒体最终下载失败时，将对应消息原始 JSON 追加写入 `failed_media_messages.jsonl`
 - 记录内容包括消息 ID、时间、sender、媒体引用、错误信息和完整 `raw_message`
 
-### 8. 引用消息排查
+### 9. 引用消息排查
 
 - 已新增诊断命令 [cmd/inspect_quote/main.go](cmd/inspect_quote/main.go)
 - 已修复该命令对数值型消息 ID 的解析问题
@@ -75,6 +86,13 @@
 
 - 已执行 `GOCACHE=/tmp/weibo_group_chat_monitor_gocache go test -v -count=1 ./telegram`
 - 已执行 `GOCACHE=/tmp/weibo_group_chat_monitor_gocache go test -v -count=1 -run 'TestBuildSenderSummaryMessages|TestBuildSenderSummariesCollectsMediaPaths' ./groupchat`
+- 已新增本地历史读取测试，覆盖：
+- 按天历史目录读取
+- 旧单文件历史兼容读取
+- sender 过滤
+- 日期范围过滤
+- `max_records` 限流
+- 旧单文件与按天文件重复消息去重
 - 新增摘要媒体同步相关测试，覆盖：
 - caption 分块
 - 媒体发送后编辑 caption
@@ -86,6 +104,7 @@
 
 - 群聊抓取、按天落盘、按 sender 汇总、停止条件、媒体回退下载、失败原始 JSON 记录能力均已落地
 - group chat 摘要已支持把本地媒体文件同步发送到 Telegram
+- 已支持直接读取本地历史并按 sender 过滤后推送到 Telegram
 - 当前摘要发送模型已改为按 `caption` 容量切块，并在摘要文本中插入指向本块媒体消息的跳转链接
 - 当前去重逻辑依赖历史文件中的消息 ID；若本地已存在同 ID 消息，则不会再次进入提醒模块
 - 引用消息暂时只能通过解析 `content` 中的分隔线文本识别，现阶段不能依赖结构化字段

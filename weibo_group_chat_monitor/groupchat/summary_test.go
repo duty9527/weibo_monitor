@@ -94,6 +94,38 @@ func TestBuildSenderSummariesCollectsMediaPaths(t *testing.T) {
 	}
 }
 
+func TestBuildLocalHistorySenderSummariesUsesHistoryHeader(t *testing.T) {
+	records := []OutputRecord{
+		{
+			ID:      "1",
+			Time:    "2026-04-01 08:00:00",
+			Date:    "2026-04-01",
+			Sender:  "alice",
+			Message: "第一条",
+		},
+		{
+			ID:      "2",
+			Time:    "2026-04-02 09:00:00",
+			Date:    "2026-04-02",
+			Sender:  "alice",
+			Message: "第二条",
+		},
+	}
+
+	summaries := BuildLocalHistorySenderSummaries(records, []string{"alice"})
+	if len(summaries) != 1 {
+		t.Fatalf("expected 1 summary, got %d", len(summaries))
+	}
+
+	header := summaries[0].Header
+	if !strings.Contains(header, "本地历史筛选结果") {
+		t.Fatalf("unexpected header: %q", header)
+	}
+	if !strings.Contains(header, "2026-04-01 至 2026-04-02") {
+		t.Fatalf("expected history date range, got %q", header)
+	}
+}
+
 func stringPtr(value string) *string {
 	return &value
 }

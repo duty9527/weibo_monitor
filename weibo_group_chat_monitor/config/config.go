@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -16,14 +17,15 @@ type WeiboModeConfig struct {
 }
 
 type GroupChatModeConfig struct {
-	Browser       BrowserConfig         `yaml:"browser"`
-	Chat          ChatConfig            `yaml:"chat"`
-	Output        GroupChatOutputConfig `yaml:"output"`
-	State         GroupChatStateConfig  `yaml:"state"`
-	Filters       GroupChatFilterConfig `yaml:"filters"`
-	StopCondition StopCondition         `yaml:"stop_condition"`
-	Telegram      TelegramConfig        `yaml:"telegram"`
-	Log           LogConfig             `yaml:"log"`
+	Browser       BrowserConfig          `yaml:"browser"`
+	Chat          ChatConfig             `yaml:"chat"`
+	Output        GroupChatOutputConfig  `yaml:"output"`
+	State         GroupChatStateConfig   `yaml:"state"`
+	Filters       GroupChatFilterConfig  `yaml:"filters"`
+	LocalHistory  LocalHistoryPushConfig `yaml:"local_history_push"`
+	StopCondition StopCondition          `yaml:"stop_condition"`
+	Telegram      TelegramConfig         `yaml:"telegram"`
+	Log           LogConfig              `yaml:"log"`
 }
 
 type WeiboConfig struct {
@@ -80,6 +82,12 @@ type GroupChatStateConfig struct {
 
 type GroupChatFilterConfig struct {
 	TargetSenders []string `yaml:"target_senders"`
+}
+
+type LocalHistoryPushConfig struct {
+	StartDate  string `yaml:"start_date"`
+	EndDate    string `yaml:"end_date"`
+	MaxRecords int    `yaml:"max_records"`
 }
 
 type StopCondition struct {
@@ -266,6 +274,22 @@ func (c *GroupChatModeConfig) validate() error {
 	}
 
 	c.Filters.TargetSenders = trimNonEmptyStrings(c.Filters.TargetSenders)
+	c.LocalHistory.StartDate = strings.TrimSpace(c.LocalHistory.StartDate)
+	c.LocalHistory.EndDate = strings.TrimSpace(c.LocalHistory.EndDate)
+	if c.LocalHistory.MaxRecords < 0 {
+		return fmt.Errorf("local_history_push.max_records 不能小于 0")
+	}
+	startDate, startOK := parseDateOnly(c.LocalHistory.StartDate)
+	endDate, endOK := parseDateOnly(c.LocalHistory.EndDate)
+	if c.LocalHistory.StartDate != "" && !startOK {
+		return fmt.Errorf("local_history_push.start_date 格式非法，应为 YYYY-MM-DD")
+	}
+	if c.LocalHistory.EndDate != "" && !endOK {
+		return fmt.Errorf("local_history_push.end_date 格式非法，应为 YYYY-MM-DD")
+	}
+	if startOK && endOK && startDate.After(endDate) {
+		return fmt.Errorf("local_history_push.start_date 不能晚于 end_date")
+	}
 
 	if err := validateCommon(&c.Telegram, &c.Log); err != nil {
 		return err
@@ -336,4 +360,15 @@ func trimNonEmptyStrings(values []string) []string {
 		result = append(result, value)
 	}
 	return result
+}
+
+func parseDateOnly(value string) (time.Time, bool) {
+	if value == "" {
+		return time.Time{}, false
+	}
+	parsed, err := time.ParseInLocation("2006-01-02", value, time.Local)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return parsed, true
 }

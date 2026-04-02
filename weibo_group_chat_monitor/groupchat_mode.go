@@ -55,17 +55,8 @@ func executeGroupChatOnce(ctx context.Context, cfg *config.GroupChatModeConfig, 
 
 	if notifier.Enabled() {
 		summaries := groupchat.BuildSenderSummaries(time.Now(), result.NewRecords, cfg.Filters.TargetSenders)
-		for _, summary := range summaries {
-			entries := make([]telegram.GroupChatSummaryEntry, 0, len(summary.Entries))
-			for _, entry := range summary.Entries {
-				entries = append(entries, telegram.GroupChatSummaryEntry{
-					Text:       entry.Text,
-					MediaPaths: entry.MediaPaths,
-				})
-			}
-			if err := notifier.SendGroupChatSummary(ctx, summary.Header, entries); err != nil {
-				return fmt.Errorf("推送群聊摘要失败: %w", err)
-			}
+		if err := sendGroupChatSummaries(ctx, notifier, summaries); err != nil {
+			return fmt.Errorf("推送群聊摘要失败: %w", err)
 		}
 		logger.Info("群聊摘要推送完成", "message_count", len(summaries))
 	}

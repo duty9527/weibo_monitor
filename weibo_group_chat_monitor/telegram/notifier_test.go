@@ -287,6 +287,7 @@ func TestSendGroupChatSummaryEditsCaptionWithMediaLinks(t *testing.T) {
 	var paths []string
 	var texts []string
 	var editCaptions []string
+	var editParseModes []string
 	client := NewClient(config.TelegramConfig{
 		Enabled: true,
 		ChatID:  "-10012345",
@@ -296,7 +297,8 @@ func TestSendGroupChatSummaryEditsCaptionWithMediaLinks(t *testing.T) {
 			paths = append(paths, r.URL.Path)
 			switch r.URL.Path {
 			case "/bot/sendMessage":
-				texts = append(texts, readFormField(t, r, "text"))
+				values := readFormValues(t, r)
+				texts = append(texts, values.Get("text"))
 				return &http.Response{
 					StatusCode: http.StatusOK,
 					Header:     make(http.Header),
@@ -315,7 +317,9 @@ func TestSendGroupChatSummaryEditsCaptionWithMediaLinks(t *testing.T) {
 					Body:       io.NopCloser(strings.NewReader(`{"ok":true,"result":{"message_id":102}}`)),
 				}, nil
 			case "/bot/editMessageCaption":
-				editCaptions = append(editCaptions, readFormField(t, r, "caption"))
+				values := readFormValues(t, r)
+				editCaptions = append(editCaptions, values.Get("caption"))
+				editParseModes = append(editParseModes, values.Get("parse_mode"))
 				return &http.Response{
 					StatusCode: http.StatusOK,
 					Header:     make(http.Header),
@@ -350,10 +354,13 @@ func TestSendGroupChatSummaryEditsCaptionWithMediaLinks(t *testing.T) {
 	if len(editCaptions) != 1 {
 		t.Fatalf("unexpected edited captions: %#v", editCaptions)
 	}
-	if !strings.Contains(editCaptions[0], "摘要头\n08:01:00 摘要正文") {
+	if editParseModes[0] != "MarkdownV2" {
+		t.Fatalf("expected MarkdownV2 parse mode, got %#v", editParseModes)
+	}
+	if !strings.Contains(editCaptions[0], "摘要头\n[08:01:00 摘要正文](https://t.me/c/12345/101)") {
 		t.Fatalf("unexpected caption body: %q", editCaptions[0])
 	}
-	if !strings.Contains(editCaptions[0], "https://t.me/c/12345/101") || !strings.Contains(editCaptions[0], "https://t.me/c/12345/102") {
+	if !strings.Contains(editCaptions[0], "[媒体2](https://t.me/c/12345/102)") {
 		t.Fatalf("expected media links in caption, got %q", editCaptions[0])
 	}
 }
@@ -405,6 +412,8 @@ func TestSendGroupChatSummarySplitsLongEntryTextBeforeMedia(t *testing.T) {
 	var paths []string
 	var texts []string
 	var editCaptions []string
+	var sendParseModes []string
+	var editParseModes []string
 	client := NewClient(config.TelegramConfig{
 		Enabled: true,
 		ChatID:  "-10012345",
@@ -414,7 +423,9 @@ func TestSendGroupChatSummarySplitsLongEntryTextBeforeMedia(t *testing.T) {
 			paths = append(paths, r.URL.Path)
 			switch r.URL.Path {
 			case "/bot/sendMessage":
-				texts = append(texts, readFormField(t, r, "text"))
+				values := readFormValues(t, r)
+				texts = append(texts, values.Get("text"))
+				sendParseModes = append(sendParseModes, values.Get("parse_mode"))
 				return &http.Response{
 					StatusCode: http.StatusOK,
 					Header:     make(http.Header),
@@ -427,7 +438,9 @@ func TestSendGroupChatSummarySplitsLongEntryTextBeforeMedia(t *testing.T) {
 					Body:       io.NopCloser(strings.NewReader(`{"ok":true,"result":{"message_id":101}}`)),
 				}, nil
 			case "/bot/editMessageCaption":
-				editCaptions = append(editCaptions, readFormField(t, r, "caption"))
+				values := readFormValues(t, r)
+				editCaptions = append(editCaptions, values.Get("caption"))
+				editParseModes = append(editParseModes, values.Get("parse_mode"))
 				return &http.Response{
 					StatusCode: http.StatusOK,
 					Header:     make(http.Header),
@@ -458,6 +471,15 @@ func TestSendGroupChatSummarySplitsLongEntryTextBeforeMedia(t *testing.T) {
 	}
 	if len(texts) != 2 {
 		t.Fatalf("unexpected text payloads: %#v", texts)
+	}
+	if sendParseModes[0] != "" {
+		t.Fatalf("expected first text chunk to remain plain text, got %#v", sendParseModes)
+	}
+	if sendParseModes[1] != "MarkdownV2" {
+		t.Fatalf("expected overflow chunk to use MarkdownV2, got %#v", sendParseModes)
+	}
+	if len(editParseModes) != 1 || editParseModes[0] != "MarkdownV2" {
+		t.Fatalf("expected MarkdownV2 caption edit, got %#v", editParseModes)
 	}
 	if len(editCaptions) != 1 || editCaptions[0] == "" {
 		t.Fatalf("expected non-empty final caption, got %#v", editCaptions)
@@ -503,6 +525,12 @@ func readMultipartField(t *testing.T, r *http.Request, name string) string {
 func readFormField(t *testing.T, r *http.Request, name string) string {
 	t.Helper()
 
+	return readFormValues(t, r).Get(name)
+}
+
+func readFormValues(t *testing.T, r *http.Request) url.Values {
+	t.Helper()
+
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		t.Fatalf("read form body: %v", err)
@@ -512,7 +540,7 @@ func readFormField(t *testing.T, r *http.Request, name string) string {
 	if err != nil {
 		t.Fatalf("parse form body: %v", err)
 	}
-	return values.Get(name)
+	return values
 }
 
 type roundTripFunc func(*http.Request) (*http.Response, error)

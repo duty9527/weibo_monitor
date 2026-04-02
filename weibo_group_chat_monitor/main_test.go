@@ -30,3 +30,16 @@ func TestParseModeArgsFlag(t *testing.T) {
 		t.Fatalf("unexpected remaining args: %#v", remaining)
 	}
 }
+
+func TestParseModeArgsGroupChatHistoryAlias(t *testing.T) {
+	mode, remaining, err := parseModeArgs([]string{"groupchat-history", "-config", "c.yaml"})
+	if err != nil {
+		t.Fatalf("parseModeArgs failed: %v", err)
+	}
+	if mode != "groupchat-history" {
+		t.Fatalf("unexpected mode: %s", mode)
+	}
+	if !reflect.DeepEqual(remaining, []string{"-config", "c.yaml"}) {
+		t.Fatalf("unexpected remaining args: %#v", remaining)
+	}
+}

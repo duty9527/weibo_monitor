@@ -19,6 +19,22 @@ type SenderSummaryEntry struct {
 }
 
 func BuildSenderSummaries(now time.Time, records []OutputRecord, filters []string) []SenderSummary {
+	return buildSenderSummaries(records, filters, func(sender string, senderRecords []OutputRecord) string {
+		return FormatSenderSummaryHeader(now, sender, len(senderRecords))
+	})
+}
+
+func BuildLocalHistorySenderSummaries(records []OutputRecord, filters []string) []SenderSummary {
+	return buildSenderSummaries(records, filters, func(sender string, senderRecords []OutputRecord) string {
+		return FormatLocalHistorySummaryHeader(sender, senderRecords)
+	})
+}
+
+func buildSenderSummaries(
+	records []OutputRecord,
+	filters []string,
+	headerFn func(sender string, senderRecords []OutputRecord) string,
+) []SenderSummary {
 	grouped := make(map[string][]OutputRecord)
 	for _, record := range records {
 		if !matchesTargetSender(record.Sender, filters) {
@@ -38,10 +54,10 @@ func BuildSenderSummaries(now time.Time, records []OutputRecord, filters []strin
 
 	summaries := make([]SenderSummary, 0, len(senders))
 	for _, sender := range senders {
-		records := append([]OutputRecord(nil), grouped[sender]...)
-		sortOutputRecords(records)
-		entries := make([]SenderSummaryEntry, 0, len(records))
-		for _, record := range records {
+		senderRecords := append([]OutputRecord(nil), grouped[sender]...)
+		sortOutputRecords(senderRecords)
+		entries := make([]SenderSummaryEntry, 0, len(senderRecords))
+		for _, record := range senderRecords {
 			entries = append(entries, SenderSummaryEntry{
 				Text:       formatSenderSummaryEntry(record),
 				MediaPaths: splitMediaPaths(record.DownloadedMedia),
@@ -49,7 +65,7 @@ func BuildSenderSummaries(now time.Time, records []OutputRecord, filters []strin
 		}
 		summaries = append(summaries, SenderSummary{
 			Sender:  sender,
-			Header:  FormatSenderSummaryHeader(now, sender, len(records)),
+			Header:  headerFn(sender, senderRecords),
 			Entries: entries,
 		})
 	}
@@ -85,6 +101,38 @@ func FormatSenderSummaryHeader(now time.Time, sender string, count int) string {
 	}, "\n")
 }
 
+func FormatLocalHistorySummaryHeader(sender string, records []OutputRecord) string {
+	count := len(records)
+	if count == 0 {
+		return strings.Join([]string{
+			"本地历史筛选结果",
+			fmt.Sprintf("%s发送了0条消息。", strings.TrimSpace(sender)),
+		}, "\n")
+	}
+
+	firstDate := summaryHeaderDate(records[0])
+	lastDate := summaryHeaderDate(records[len(records)-1])
+	rangeText := firstDate
+	if firstDate != "" && lastDate != "" && firstDate != lastDate {
+		rangeText = firstDate + " 至 " + lastDate
+	}
+	if rangeText == "" {
+		rangeText = "时间范围未知"
+	}
+
+	return strings.Join([]string{
+		"本地历史筛选结果",
+		fmt.Sprintf("%s发送了%d条消息，时间范围：%s", strings.TrimSpace(sender), count, rangeText),
+	}, "\n")
+}
+
+func summaryHeaderDate(record OutputRecord) string {
+	if parsed, ok := record.ParsedTime(); ok {
+		return parsed.Format("2006-01-02")
+	}
+	return strings.TrimSpace(record.Date)
+}
+
 func summaryLineTime(record OutputRecord) string {
 	parsed, ok := record.ParsedTime()
 	if !ok {
@@ -95,12 +143,13 @@ func summaryLineTime(record OutputRecord) string {
 
 func summaryLineText(record OutputRecord) string {
 	text := normalizeInlineText(record.Message)
-	if len(splitMediaPaths(record.DownloadedMedia)) > 0 || record.HasImage {
-		if text == "" {
-			return "[图片]"
-		}
-		return text + "[图片]"
-	}
+	// if len(splitMediaPaths(record.DownloadedMedia)) > 0 || record.HasImage {
+	// if text == "" {
+	// 	return "[图片]"
+	// }
+	// return text + "[图片]"
+
+	// }
 	if text == "" {
 		return "[空消息]"
 	}
