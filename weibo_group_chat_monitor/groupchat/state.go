@@ -13,6 +13,8 @@ type RunState struct {
 	LastMessageID   string `json:"last_message_id"`
 	LastMessageTime string `json:"last_message_time"`
 	LastRunAt       string `json:"last_run_at"`
+	LastPushedID    string `json:"last_pushed_id"`
+	LastPushedTime  string `json:"last_pushed_time"`
 }
 
 func LoadRunState(path string) (*RunState, error) {
@@ -33,6 +35,13 @@ func LoadRunState(path string) (*RunState, error) {
 	if err := json.Unmarshal(data, &state); err != nil {
 		return nil, fmt.Errorf("解析群聊状态文件失败: %w", err)
 	}
+
+	// 首次升级兼容：如果推送状态为空，默认对齐到拉取状态
+	if state.LastPushedTime == "" {
+		state.LastPushedID = state.LastMessageID
+		state.LastPushedTime = state.LastMessageTime
+	}
+
 	return &state, nil
 }
 
@@ -87,4 +96,14 @@ func (s *RunState) SetLastRunAt(t time.Time) {
 		return
 	}
 	s.LastRunAt = t.In(time.Local).Format(time.RFC3339)
+}
+
+func (s *RunState) SetPushedBoundary(id string, t time.Time) {
+	if s == nil {
+		return
+	}
+	s.LastPushedID = strings.TrimSpace(id)
+	if !t.IsZero() {
+		s.LastPushedTime = t.In(time.Local).Format(outputTimeLayout)
+	}
 }

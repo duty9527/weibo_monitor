@@ -143,7 +143,7 @@ func (s *Scraper) Run(ctx context.Context) (*RunResult, error) {
 	}
 	sortOutputRecords(records)
 
-	if err := appendRecords(s.cfg.Output.HistoryFile, records); err != nil {
+	if err := AppendRecords(s.cfg.Output.HistoryFile, records); err != nil {
 		return nil, err
 	}
 

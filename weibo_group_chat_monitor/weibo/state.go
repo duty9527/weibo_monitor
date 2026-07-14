@@ -13,6 +13,7 @@ type RunState struct {
 	LastFetchedAt           string          `json:"last_fetched_at"`
 	LastPlaywrightRefreshAt string          `json:"last_playwright_refresh_at"`
 	SentMedia               map[string]bool `json:"sent_media,omitempty"`
+	LastPushedAt            string          `json:"last_pushed_at"`
 }
 
 func LoadRunState(path string) (*RunState, error) {
@@ -33,7 +34,24 @@ func LoadRunState(path string) (*RunState, error) {
 	if err := json.Unmarshal(data, &state); err != nil {
 		return nil, fmt.Errorf("解析状态文件失败: %w", err)
 	}
+
+	// 首次升级兼容：如果推送状态为空，默认对齐到拉取状态
+	if state.LastPushedAt == "" {
+		state.LastPushedAt = state.LastFetchedAt
+	}
+
 	return &state, nil
+}
+
+func (s *RunState) LastPushedTime() (time.Time, bool) {
+	return parseStateTime(s.LastPushedAt)
+}
+
+func (s *RunState) SetLastPushedTime(value time.Time) {
+	if s == nil || value.IsZero() {
+		return
+	}
+	s.LastPushedAt = value.In(time.Local).Format(time.RFC3339)
 }
 
 func SaveRunState(path string, state *RunState) error {

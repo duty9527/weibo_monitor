@@ -27,7 +27,7 @@ var (
 )
 
 var systemKeywords = []string{
-	"加入了群聊", "退出了群聊", "被移出群聊",
+	"加入了群聊", "加入了群", "退出了群聊", "退出了群", "被移出群聊", "被移出群",
 	"修改了群名", "群公告", "被设为管理员",
 	"已成为新群主", "开启了全员禁言", "关闭了全员禁言",
 }
@@ -200,7 +200,7 @@ func loadSeenIDs(path string) (map[string]struct{}, error) {
 	return seen, nil
 }
 
-func appendRecords(path string, records []OutputRecord) error {
+func AppendRecords(path string, records []OutputRecord) error {
 	if len(records) == 0 {
 		return nil
 	}

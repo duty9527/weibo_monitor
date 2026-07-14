@@ -65,10 +65,20 @@ type telegramMessage struct {
 
 // NewClient 创建 Telegram 客户端。
 func NewClient(cfg config.TelegramConfig, logger *slog.Logger) *Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	if proxyURLStr := strings.TrimSpace(cfg.ProxyURL); proxyURLStr != "" {
+		if proxyURL, err := url.Parse(proxyURLStr); err == nil {
+			transport.Proxy = http.ProxyURL(proxyURL)
+			logger.Info("Telegram 客户端启用了 HTTP 代理", "proxy", proxyURLStr)
+		} else {
+			logger.Error("解析 Telegram 代理 URL 失败", "err", err, "proxy", proxyURLStr)
+		}
+	}
 	return &Client{
 		cfg: cfg,
 		httpClient: &http.Client{
-			Timeout: time.Duration(cfg.TimeoutSeconds) * time.Second,
+			Timeout:   time.Duration(cfg.TimeoutSeconds) * time.Second,
+			Transport: transport,
 		},
 		logger: logger,
 	}
@@ -498,25 +508,51 @@ func (c *Client) sendTextChunk(ctx context.Context, text string, enablePreview b
 	}
 	c.applyThreadValues(values)
 
-	req, err := http.NewRequestWithContext(
-		ctx,
-		http.MethodPost,
-		c.apiURL("sendMessage"),
-		strings.NewReader(values.Encode()),
-	)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	maxRetries := 3
+	var lastErr error
+	for i := 0; i < maxRetries; i++ {
+		req, err := http.NewRequestWithContext(
+			ctx,
+			http.MethodPost,
+			c.apiURL("sendMessage"),
+			strings.NewReader(values.Encode()),
+		)
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("发送 Telegram 文本消息失败: %w", err)
-	}
-	defer resp.Body.Close()
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			lastErr = err
+			c.logger.Warn("发送 Telegram 文本消息失败，将进行重试...", "retry", i+1, "max", maxRetries, "err", err)
+			if i < maxRetries-1 {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(15 * time.Second):
+				}
+			}
+			continue
+		}
 
-	_, err = parseAPIResponse("sendMessage", resp)
-	return err
+		_, err = parseAPIResponse("sendMessage", resp)
+		resp.Body.Close()
+		if err != nil {
+			lastErr = err
+			c.logger.Warn("发送 Telegram 文本消息响应错误，将进行重试...", "retry", i+1, "max", maxRetries, "err", err)
+			if i < maxRetries-1 {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(15 * time.Second):
+				}
+			}
+			continue
+		}
+		return nil
+	}
+	return fmt.Errorf("发送 Telegram 文本消息达到最大重试次数: %w", lastErr)
 }
 
 func (c *Client) sendMarkdownText(ctx context.Context, text string) error {
@@ -532,25 +568,51 @@ func (c *Client) sendMarkdownText(ctx context.Context, text string) error {
 	values.Set("disable_web_page_preview", "true")
 	c.applyThreadValues(values)
 
-	req, err := http.NewRequestWithContext(
-		ctx,
-		http.MethodPost,
-		c.apiURL("sendMessage"),
-		strings.NewReader(values.Encode()),
-	)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	maxRetries := 3
+	var lastErr error
+	for i := 0; i < maxRetries; i++ {
+		req, err := http.NewRequestWithContext(
+			ctx,
+			http.MethodPost,
+			c.apiURL("sendMessage"),
+			strings.NewReader(values.Encode()),
+		)
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("发送 Telegram Markdown 文本消息失败: %w", err)
-	}
-	defer resp.Body.Close()
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			lastErr = err
+			c.logger.Warn("发送 Telegram Markdown 文本消息失败，将进行重试...", "retry", i+1, "max", maxRetries, "err", err)
+			if i < maxRetries-1 {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(15 * time.Second):
+				}
+			}
+			continue
+		}
 
-	_, err = parseAPIResponse("sendMessage", resp)
-	return err
+		_, err = parseAPIResponse("sendMessage", resp)
+		resp.Body.Close()
+		if err != nil {
+			lastErr = err
+			c.logger.Warn("发送 Telegram Markdown 文本消息响应错误，将进行重试...", "retry", i+1, "max", maxRetries, "err", err)
+			if i < maxRetries-1 {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(15 * time.Second):
+				}
+			}
+			continue
+		}
+		return nil
+	}
+	return fmt.Errorf("发送 Telegram Markdown 文本消息达到最大重试次数: %w", lastErr)
 }
 
 func (c *Client) sendMediaSet(ctx context.Context, items []mediaItem, caption string) error {
@@ -646,33 +708,59 @@ func (c *Client) sendSingleMediaWithMessageIDAs(ctx context.Context, item mediaI
 		return 0, err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.apiURL(method), &body)
-	if err != nil {
-		return 0, err
-	}
-	req.Header.Set("Content-Type", writer.FormDataContentType())
+	reqBody := body.Bytes()
+	contentType := writer.FormDataContentType()
 
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return 0, fmt.Errorf("发送 Telegram 媒体失败: %w", err)
-	}
-	defer resp.Body.Close()
-
-	result, err := parseAPIResponse(method, resp)
-	if err != nil {
-		// 图片/视频尺寸或格式不合法时，自动降级为 sendDocument 重试
-		if mediaType != "document" && isTelegramMediaInvalidError(err) {
-			c.logger.Warn("媒体格式被 Telegram 拒绝，降级为 sendDocument 重试",
-				"method", method,
-				"file", filepath.Base(item.Path),
-				"reason", err.Error(),
-			)
-			docItem := mediaItem{Path: item.Path, Type: "document", Field: "document"}
-			return c.sendSingleMediaWithMessageIDAs(ctx, docItem, caption, "document")
+	maxRetries := 3
+	var lastErr error
+	for i := 0; i < maxRetries; i++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.apiURL(method), bytes.NewReader(reqBody))
+		if err != nil {
+			return 0, err
 		}
-		return 0, err
+		req.Header.Set("Content-Type", contentType)
+
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			lastErr = err
+			c.logger.Warn("发送 Telegram 媒体失败，将进行重试...", "retry", i+1, "max", maxRetries, "err", err)
+			if i < maxRetries-1 {
+				select {
+				case <-ctx.Done():
+					return 0, ctx.Err()
+				case <-time.After(15 * time.Second):
+				}
+			}
+			continue
+		}
+
+		result, err := parseAPIResponse(method, resp)
+		resp.Body.Close()
+		if err != nil {
+			// 图片/视频尺寸或格式不合法时，自动降级为 sendDocument 重试。此类业务配置错误，由外部重试降级即可，不进行循环内部重试
+			if mediaType != "document" && isTelegramMediaInvalidError(err) {
+				c.logger.Warn("媒体格式被 Telegram 拒绝，降级为 sendDocument 重试",
+					"method", method,
+					"file", filepath.Base(item.Path),
+					"reason", err.Error(),
+				)
+				docItem := mediaItem{Path: item.Path, Type: "document", Field: "document"}
+				return c.sendSingleMediaWithMessageIDAs(ctx, docItem, caption, "document")
+			}
+			lastErr = err
+			c.logger.Warn("发送 Telegram 媒体响应错误，将进行重试...", "retry", i+1, "max", maxRetries, "err", err)
+			if i < maxRetries-1 {
+				select {
+				case <-ctx.Done():
+					return 0, ctx.Err()
+				case <-time.After(15 * time.Second):
+				}
+			}
+			continue
+		}
+		return result.MessageID, nil
 	}
-	return result.MessageID, nil
+	return 0, fmt.Errorf("发送 Telegram 媒体达到最大重试次数: %w", lastErr)
 }
 
 func (c *Client) sendMediaGroup(ctx context.Context, items []mediaItem, caption string) error {
@@ -733,43 +821,69 @@ func (c *Client) sendMediaGroup(ctx context.Context, items []mediaItem, caption 
 		return err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.apiURL("sendMediaGroup"), &body)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", writer.FormDataContentType())
+	reqBody := body.Bytes()
+	contentType := writer.FormDataContentType()
 
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("发送 Telegram 图集失败: %w", err)
-	}
-	defer resp.Body.Close()
+	maxRetries := 3
+	var lastErr error
+	for i := 0; i < maxRetries; i++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.apiURL("sendMediaGroup"), bytes.NewReader(reqBody))
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Content-Type", contentType)
 
-	_, groupErr := parseAPIResponse("sendMediaGroup", resp)
-	if groupErr != nil {
-		// 媒体组中有不合法的图片/视频时，整组回退为逐个 sendDocument
-		if isTelegramMediaInvalidError(groupErr) {
-			c.logger.Warn("sendMediaGroup 被 Telegram 拒绝，回退为逐个 sendDocument 发送",
-				"count", len(items),
-				"reason", groupErr.Error(),
-			)
-			captionUsed := false
-			for _, item := range items {
-				itemCaption := ""
-				if !captionUsed {
-					itemCaption = caption
-					captionUsed = true
-				}
-				docItem := mediaItem{Path: item.Path, Type: "document", Field: "document"}
-				if _, err := c.sendSingleMediaWithMessageIDAs(ctx, docItem, itemCaption, "document"); err != nil {
-					return err
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			lastErr = err
+			c.logger.Warn("发送 Telegram 图集失败，将进行重试...", "retry", i+1, "max", maxRetries, "err", err)
+			if i < maxRetries-1 {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(15 * time.Second):
 				}
 			}
-			return nil
+			continue
 		}
-		return groupErr
+
+		_, groupErr := parseAPIResponse("sendMediaGroup", resp)
+		resp.Body.Close()
+		if groupErr != nil {
+			// 媒体组中有不合法的图片/视频时，整组回退为逐个 sendDocument 发送。此类业务配置错误，不进行循环内部重试，直接执行降级
+			if isTelegramMediaInvalidError(groupErr) {
+				c.logger.Warn("sendMediaGroup 被 Telegram 拒绝，回退为逐个 sendDocument 发送",
+					"count", len(items),
+					"reason", groupErr.Error(),
+				)
+				captionUsed := false
+				for _, item := range items {
+					itemCaption := ""
+					if !captionUsed {
+						itemCaption = caption
+						captionUsed = true
+					}
+					docItem := mediaItem{Path: item.Path, Type: "document", Field: "document"}
+					if _, err := c.sendSingleMediaWithMessageIDAs(ctx, docItem, itemCaption, "document"); err != nil {
+						return err
+					}
+				}
+				return nil
+			}
+			lastErr = groupErr
+			c.logger.Warn("发送 Telegram 图集响应错误，将进行重试...", "retry", i+1, "max", maxRetries, "err", groupErr)
+			if i < maxRetries-1 {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(15 * time.Second):
+				}
+			}
+			continue
+		}
+		return nil
 	}
-	return nil
+	return fmt.Errorf("发送 Telegram 图集达到最大重试次数: %w", lastErr)
 }
 
 func (c *Client) applyThreadValues(values url.Values) {
@@ -837,25 +951,51 @@ func (c *Client) editMessageCaptionMarkdown(ctx context.Context, messageID int, 
 	values.Set("show_caption_above_media", "true")
 	c.applyThreadValues(values)
 
-	req, err := http.NewRequestWithContext(
-		ctx,
-		http.MethodPost,
-		c.apiURL("editMessageCaption"),
-		strings.NewReader(values.Encode()),
-	)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	maxRetries := 3
+	var lastErr error
+	for i := 0; i < maxRetries; i++ {
+		req, err := http.NewRequestWithContext(
+			ctx,
+			http.MethodPost,
+			c.apiURL("editMessageCaption"),
+			strings.NewReader(values.Encode()),
+		)
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("编辑 Telegram Markdown caption 失败: %w", err)
-	}
-	defer resp.Body.Close()
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			lastErr = err
+			c.logger.Warn("编辑 Telegram Markdown caption 失败，将进行重试...", "retry", i+1, "max", maxRetries, "err", err)
+			if i < maxRetries-1 {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(15 * time.Second):
+				}
+			}
+			continue
+		}
 
-	_, err = parseAPIResponse("editMessageCaption", resp)
-	return err
+		_, err = parseAPIResponse("editMessageCaption", resp)
+		resp.Body.Close()
+		if err != nil {
+			lastErr = err
+			c.logger.Warn("编辑 Telegram Markdown caption 响应错误，将进行重试...", "retry", i+1, "max", maxRetries, "err", err)
+			if i < maxRetries-1 {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(15 * time.Second):
+				}
+			}
+			continue
+		}
+		return nil
+	}
+	return fmt.Errorf("编辑 Telegram Markdown caption 达到最大重试次数: %w", lastErr)
 }
 
 func (c *Client) messageLink(messageID int) string {

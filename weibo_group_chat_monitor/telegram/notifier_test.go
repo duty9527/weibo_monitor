@@ -357,7 +357,7 @@ func TestSendGroupChatSummaryEditsCaptionWithMediaLinks(t *testing.T) {
 	if editParseModes[0] != "MarkdownV2" {
 		t.Fatalf("expected MarkdownV2 parse mode, got %#v", editParseModes)
 	}
-	if !strings.Contains(editCaptions[0], "摘要头\n[08:01:00 摘要正文](https://t.me/c/12345/101)") {
+	if !strings.Contains(editCaptions[0], "摘要头\n08:01:00 [摘要正文](https://t.me/c/12345/101)") {
 		t.Fatalf("unexpected caption body: %q", editCaptions[0])
 	}
 	if !strings.Contains(editCaptions[0], "[媒体2](https://t.me/c/12345/102)") {

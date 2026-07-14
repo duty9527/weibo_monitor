@@ -149,8 +149,8 @@ func TestAppendRecordsSplitsByDay(t *testing.T) {
 		{ID: "3", Time: "2026-04-01 08:00:00", Date: "2026-04-01", Sender: "bob", Message: "c"},
 	}
 
-	if err := appendRecords(basePath, records); err != nil {
-		t.Fatalf("appendRecords failed: %v", err)
+	if err := AppendRecords(basePath, records); err != nil {
+		t.Fatalf("AppendRecords failed: %v", err)
 	}
 
 	firstDay := filepath.Join(dir, "2026-03-31.jsonl")
