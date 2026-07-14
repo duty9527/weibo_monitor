@@ -67,7 +67,7 @@ func (c *TelegramClient) GetUpdates(ctx context.Context, cfg Config, offset int6
 	payload := map[string]any{
 		"offset":          offset,
 		"timeout":         timeout,
-		"allowed_updates": []string{"message"},
+		"allowed_updates": []string{"message", "edited_message"},
 	}
 
 	var resp TelegramAPIResponse[[]TelegramUpdate]
@@ -90,6 +90,9 @@ func (c *TelegramClient) SendText(ctx context.Context, cfg Config, target Target
 		}
 		if target.ThreadID > 0 {
 			payload["message_thread_id"] = target.ThreadID
+		}
+		if target.ReplyToMessageID > 0 {
+			payload["reply_to_message_id"] = target.ReplyToMessageID
 		}
 		if !enablePreview {
 			payload["disable_web_page_preview"] = true
@@ -469,6 +472,9 @@ func basicTargetFields(target Target) map[string]string {
 	}
 	if target.ThreadID > 0 {
 		fields["message_thread_id"] = strconv.FormatInt(target.ThreadID, 10)
+	}
+	if target.ReplyToMessageID > 0 {
+		fields["reply_to_message_id"] = strconv.FormatInt(target.ReplyToMessageID, 10)
 	}
 	return fields
 }

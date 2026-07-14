@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -28,6 +29,7 @@ func NewApp(configPath string) (*App, error) {
 	if err != nil {
 		return nil, err
 	}
+	logAutoScrapeTopics(cfg)
 	return &App{
 		configManager: manager,
 		tg:            NewTelegramClient(),
@@ -72,7 +74,7 @@ func (a *App) Run(ctx context.Context) error {
 			}
 			continue
 		}
-
+		// log.Printf("拉取到 %d 条 Telegram 更新", len(updates))
 		for _, update := range updates {
 			if update.UpdateID >= offset {
 				offset = update.UpdateID + 1
@@ -91,8 +93,9 @@ func (a *App) Run(ctx context.Context) error {
 }
 
 func (a *App) handleMessage(ctx context.Context, msg TelegramMessage) {
-	command, arg, ok := parseCommand(msg.Text)
+	command, arg, ok := parseCommand(messageText(msg))
 	if !ok {
+		a.handleAutoScrape(ctx, msg)
 		return
 	}
 
@@ -109,6 +112,24 @@ func (a *App) handleMessage(ctx context.Context, msg TelegramMessage) {
 	}
 }
 
+func (a *App) handleAutoScrape(ctx context.Context, msg TelegramMessage) {
+	cfg := a.configManager.Current()
+	if !cfg.shouldAutoScrapeTopic(msg.Chat.ID, msg.MessageThreadID) {
+		return
+	}
+	if !cfg.chatAllowed(msg.Chat.ID) {
+		return
+	}
+
+	link := extractFirstURL(messageText(msg))
+	if link == "" {
+		return
+	}
+
+	log.Printf("检测到 Topic 自动抓取消息: chat_id=%d thread_id=%d message_id=%d", msg.Chat.ID, msg.MessageThreadID, msg.MessageID)
+	a.runScrape(ctx, msg, link)
+}
+
 func (a *App) runScrape(ctx context.Context, msg TelegramMessage, arg string) {
 	select {
 	case a.semaphore <- struct{}{}:
@@ -121,7 +142,7 @@ func (a *App) runScrape(ctx context.Context, msg TelegramMessage, arg string) {
 
 func (a *App) handleScrape(ctx context.Context, msg TelegramMessage, arg string) {
 	cfg := a.configManager.Current()
-	target := targetFromMessage(msg)
+	target := replyTargetFromMessage(msg)
 
 	if !cfg.chatAllowed(msg.Chat.ID) {
 		log.Printf("忽略未授权 chat_id=%d 的抓取请求", msg.Chat.ID)
@@ -134,7 +155,7 @@ func (a *App) handleScrape(ctx context.Context, msg TelegramMessage, arg string)
 		return
 	}
 
-	_ = a.tg.SendText(ctx, cfg, target, "开始抓取，请稍候…", false)
+	// _ = a.tg.SendText(ctx, cfg, target, "开始抓取，请稍候…", false)
 
 	record, err := a.weibo.Scrape(ctx, cfg, link)
 	if err != nil {
@@ -154,6 +175,33 @@ func targetFromMessage(msg TelegramMessage) Target {
 	return Target{
 		ChatID:   msg.Chat.ID,
 		ThreadID: msg.MessageThreadID,
+	}
+}
+
+func logAutoScrapeTopics(cfg Config) {
+	if len(cfg.Telegram.AutoScrapeTopics) == 0 {
+		log.Printf("Topic 自动抓取未启用: 未配置 telegram.auto_scrape_topics")
+		return
+	}
+
+	for _, rule := range cfg.Telegram.AutoScrapeTopics {
+		topics := "all topics"
+		if len(rule.TopicIDs) > 0 {
+			ids := make([]string, 0, len(rule.TopicIDs))
+			for _, id := range rule.TopicIDs {
+				ids = append(ids, strconv.FormatInt(id, 10))
+			}
+			topics = strings.Join(ids, ", ")
+		}
+		log.Printf("监听 Topic 自动抓取: chat_id=%d topic_ids=%s", rule.ChatID, topics)
+	}
+}
+
+func replyTargetFromMessage(msg TelegramMessage) Target {
+	return Target{
+		ChatID:           msg.Chat.ID,
+		ThreadID:         msg.MessageThreadID,
+		ReplyToMessageID: msg.MessageID,
 	}
 }
 
@@ -195,6 +243,10 @@ func extractFirstURL(text string) string {
 	return ""
 }
 
+func messageText(msg TelegramMessage) string {
+	return strings.TrimSpace(firstNonEmpty(msg.Text, msg.Caption))
+}
+
 func sleepWithContext(ctx context.Context, d time.Duration) error {
 	timer := time.NewTimer(d)
 	defer timer.Stop()
@@ -207,7 +259,7 @@ func sleepWithContext(ctx context.Context, d time.Duration) error {
 }
 
 func main() {
-	configPath := flag.String("config", "config.json", "配置文件路径")
+	configPath := flag.String("config", "config.bot.yaml", "配置文件路径")
 	flag.Parse()
 
 	app, err := NewApp(*configPath)

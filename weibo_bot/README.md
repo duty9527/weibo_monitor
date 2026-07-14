@@ -5,8 +5,8 @@ Go 编写的 Telegram 机器人。收到 `/scrape 微博链接` 后，会调用�
 
 ## 启动
 
-1. 复制 `config.example.json` 为 `config.json`
-2. 在 `config.json` 中填写 `telegram.bot_token`
+1. 复制 `config.example.yaml` 为 `config.yaml`
+2. 在 `config.yaml` 中填写 `telegram.bot_token`
 3. 准备一个已经登录微博的 Playwright 持久化目录，默认是 `weibo_user_data`
    可以直接复用你原来 Python 脚本使用的那个目录
 4. 安装 Playwright Chromium 运行时：
@@ -21,14 +21,34 @@ go run github.com/playwright-community/playwright-go/cmd/playwright install chro
 go run .
 ```
 
+或显式指定：
+
+```bash
+go run . -config config.yaml
+```
+
 ## 配置
 
 - `telegram.allowed_chat_ids` 留空表示所有 chat 都允许
+- `telegram.auto_scrape_topics` 用于监听指定群 topic，消息里出现微博链接时会自动抓取并回复到当前 topic
+- `telegram.auto_scrape_topics[].chat_id` 填目标群 ID，`topic_ids` 填要监听的 topic `message_thread_id`
+- 如果某条 `auto_scrape_topics` 不写 `topic_ids`，表示监听该群下所有 topic
 - `weibo.cookie_source` 默认为 `playwright`，会以无头 Playwright 打开 `weibo.user_data_dir` 并提取 Cookie
 - `weibo.cookie_source` 也可改成 `static`，回退到 `weibo.cookie` 或 `weibo.cookie_file`
 - `weibo.user_data_dir` 应当是独立的 Playwright 用户目录，不要复用日常 Chrome 默认目录
+- `weibo.user_data_dir`、`weibo.cookie_file`、`weibo.download_dir`、`weibo.save_record_dir` 支持相对路径，程序会按 `config.yaml` 所在目录展开成绝对路径
 - `weibo.download_media` 控制是否下载图片/视频
 - `weibo.save_record` 控制是否落盘 `weibo_<id>.json`
+
+示例：
+
+```yaml
+telegram:
+  allowed_chat_ids: [-1001234567890]
+  auto_scrape_topics:
+    - chat_id: -1001234567890
+      topic_ids: [1001, 1002]
+```
 
 ## 命令
 

@@ -1,51 +1,59 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 const defaultUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
 
 type Config struct {
-	App      AppConfig      `json:"app"`
-	Telegram TelegramConfig `json:"telegram"`
-	Weibo    WeiboConfig    `json:"weibo"`
+	App      AppConfig      `json:"app" yaml:"app"`
+	Telegram TelegramConfig `json:"telegram" yaml:"telegram"`
+	Weibo    WeiboConfig    `json:"weibo" yaml:"weibo"`
 }
 
 type AppConfig struct {
-	MaxConcurrentScrapes int `json:"max_concurrent_scrapes"`
+	MaxConcurrentScrapes int `json:"max_concurrent_scrapes" yaml:"max_concurrent_scrapes"`
 }
 
 type TelegramConfig struct {
-	BotToken           string  `json:"bot_token"`
-	APIBase            string  `json:"api_base"`
-	PollTimeoutSeconds int     `json:"poll_timeout_seconds"`
-	AllowedChatIDs     []int64 `json:"allowed_chat_ids"`
+	BotToken           string                     `json:"bot_token" yaml:"bot_token"`
+	APIBase            string                     `json:"api_base" yaml:"api_base"`
+	PollTimeoutSeconds int                        `json:"poll_timeout_seconds" yaml:"poll_timeout_seconds"`
+	AllowedChatIDs     []int64                    `json:"allowed_chat_ids" yaml:"allowed_chat_ids"`
+	AutoScrapeTopics   []TelegramTopicWatchConfig `json:"auto_scrape_topics" yaml:"auto_scrape_topics"`
+}
+
+type TelegramTopicWatchConfig struct {
+	ChatID   int64   `json:"chat_id" yaml:"chat_id"`
+	TopicIDs []int64 `json:"topic_ids" yaml:"topic_ids"`
 }
 
 type WeiboConfig struct {
-	Cookie                      string `json:"cookie"`
-	CookieFile                  string `json:"cookie_file"`
-	CookieSource                string `json:"cookie_source"`
-	UserAgent                   string `json:"user_agent"`
-	Referer                     string `json:"referer"`
-	RequestTimeoutSeconds       int    `json:"request_timeout_seconds"`
-	MediaDownloadTimeoutSeconds int    `json:"media_download_timeout_seconds"`
-	DownloadMedia               bool   `json:"download_media"`
-	DownloadDir                 string `json:"download_dir"`
-	SaveRecord                  bool   `json:"save_record"`
-	SaveRecordDir               string `json:"save_record_dir"`
-	UserDataDir                 string `json:"user_data_dir"`
-	PlaywrightHeadless          bool   `json:"playwright_headless"`
-	CookieWarmupURL             string `json:"cookie_warmup_url"`
-	CookieWaitMillis            int    `json:"cookie_wait_millis"`
-	PlaywrightTimeoutSeconds    int    `json:"playwright_timeout_seconds"`
+	Cookie                      string `json:"cookie" yaml:"cookie"`
+	CookieFile                  string `json:"cookie_file" yaml:"cookie_file"`
+	CookieSource                string `json:"cookie_source" yaml:"cookie_source"`
+	UserAgent                   string `json:"user_agent" yaml:"user_agent"`
+	Referer                     string `json:"referer" yaml:"referer"`
+	RequestTimeoutSeconds       int    `json:"request_timeout_seconds" yaml:"request_timeout_seconds"`
+	MediaDownloadTimeoutSeconds int    `json:"media_download_timeout_seconds" yaml:"media_download_timeout_seconds"`
+	DownloadMedia               bool   `json:"download_media" yaml:"download_media"`
+	DownloadDir                 string `json:"download_dir" yaml:"download_dir"`
+	SaveRecord                  bool   `json:"save_record" yaml:"save_record"`
+	SaveRecordDir               string `json:"save_record_dir" yaml:"save_record_dir"`
+	UserDataDir                 string `json:"user_data_dir" yaml:"user_data_dir"`
+	PlaywrightHeadless          bool   `json:"playwright_headless" yaml:"playwright_headless"`
+	CookieWarmupURL             string `json:"cookie_warmup_url" yaml:"cookie_warmup_url"`
+	CookieWaitMillis            int    `json:"cookie_wait_millis" yaml:"cookie_wait_millis"`
+	PlaywrightTimeoutSeconds    int    `json:"playwright_timeout_seconds" yaml:"playwright_timeout_seconds"`
 }
 
 func (c *Config) applyDefaults() {
@@ -138,6 +146,48 @@ func (c Config) chatAllowed(chatID int64) bool {
 	return false
 }
 
+func (c Config) shouldAutoScrapeTopic(chatID, threadID int64) bool {
+	if chatID == 0 || threadID == 0 {
+		return false
+	}
+	for _, rule := range c.Telegram.AutoScrapeTopics {
+		if rule.ChatID != chatID {
+			continue
+		}
+		if len(rule.TopicIDs) == 0 {
+			return true
+		}
+		for _, topicID := range rule.TopicIDs {
+			if topicID == threadID {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (c *Config) resolvePaths(configPath string) error {
+	baseDir := filepath.Dir(configPath)
+	absBaseDir, err := filepath.Abs(baseDir)
+	if err != nil {
+		return fmt.Errorf("解析配置文件目录失败: %w", err)
+	}
+
+	c.Weibo.CookieFile = resolveConfigRelativePath(absBaseDir, c.Weibo.CookieFile)
+	c.Weibo.DownloadDir = resolveConfigRelativePath(absBaseDir, c.Weibo.DownloadDir)
+	c.Weibo.SaveRecordDir = resolveConfigRelativePath(absBaseDir, c.Weibo.SaveRecordDir)
+	c.Weibo.UserDataDir = resolveConfigRelativePath(absBaseDir, c.Weibo.UserDataDir)
+	return nil
+}
+
+func resolveConfigRelativePath(baseDir, value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || filepath.IsAbs(value) {
+		return value
+	}
+	return filepath.Join(baseDir, value)
+}
+
 type ConfigManager struct {
 	path       string
 	mu         sync.RWMutex
@@ -171,10 +221,13 @@ func (m *ConfigManager) Load() (Config, error) {
 	}
 
 	var cfg Config
-	if err := json.Unmarshal(data, &cfg); err != nil {
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return Config{}, fmt.Errorf("解析配置文件失败: %w", err)
 	}
 	cfg.applyDefaults()
+	if err := cfg.resolvePaths(m.path); err != nil {
+		return Config{}, err
+	}
 	if err := cfg.validate(); err != nil {
 		return Config{}, err
 	}

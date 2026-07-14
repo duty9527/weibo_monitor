@@ -24,6 +24,7 @@ type TelegramMessage struct {
 	Chat            TelegramChat     `json:"chat"`
 	From            *TelegramUser    `json:"from"`
 	Text            string           `json:"text"`
+	Caption         string           `json:"caption"`
 	Entities        []TelegramEntity `json:"entities"`
 }
 
@@ -58,8 +59,9 @@ type TelegramMenuButton struct {
 }
 
 type Target struct {
-	ChatID   int64
-	ThreadID int64
+	ChatID           int64
+	ThreadID         int64
+	ReplyToMessageID int64
 }
 
 type Record struct {

@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 
@@ -25,6 +27,10 @@ func (p *CookieProvider) Header(ctx context.Context, cfg Config) (string, error)
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
+	if err := ensureUserDataDirAvailable(cfg.Weibo.UserDataDir); err != nil {
+		return "", err
+	}
 
 	pw, err := p.ensurePlaywright()
 	if err != nil {
@@ -102,6 +108,42 @@ func (p *CookieProvider) ensurePlaywright() (*playwright.Playwright, error) {
 	}
 	p.pw = pw
 	return p.pw, nil
+}
+
+func ensureUserDataDirAvailable(dir string) error {
+	if strings.TrimSpace(dir) == "" {
+		return fmt.Errorf("weibo.user_data_dir 不能为空")
+	}
+
+	info, err := os.Stat(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("检查 Playwright 用户目录失败: %w", err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("Playwright 用户目录不是目录: %s", dir)
+	}
+
+	lockNames := []string{"SingletonLock", "SingletonSocket", "SingletonCookie"}
+	var found []string
+	for _, name := range lockNames {
+		lockPath := filepath.Join(dir, name)
+		if _, err := os.Lstat(lockPath); err == nil {
+			found = append(found, lockPath)
+			continue
+		} else if !os.IsNotExist(err) {
+			return fmt.Errorf("检查 Playwright 用户目录锁文件失败: %w", err)
+		}
+	}
+	if len(found) > 0 {
+		return fmt.Errorf(
+			"Playwright 用户目录正在被其他进程占用，已跳过启动以避免锁冲突: %s",
+			strings.Join(found, ", "),
+		)
+	}
+	return nil
 }
 
 func ensurePage(browserContext playwright.BrowserContext) (playwright.Page, error) {
