@@ -4,7 +4,7 @@ weibo:
   state_file: "weibo_state.json"
   history_file: "weibo_history.jsonl"
   media_dir: "media_downloads"
-  user_data_dir: "../weibo_user_data"
+  user_data_dir: "../weibo_user_data/weibo_scraper"
   cookie_file: ""
   cookie_string: ""
   browser_app: "Google Chrome"
@@ -24,6 +24,7 @@ telegram:
   direct_messages_topic_id: 0
   enabled: false
   timeout_seconds: 30
+  proxy_url: ""
 
 log:
   level: "info"

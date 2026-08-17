@@ -104,6 +104,7 @@ type TelegramConfig struct {
 	DirectMessagesTopicID int    `yaml:"direct_messages_topic_id"`
 	Enabled               bool   `yaml:"enabled"`
 	TimeoutSeconds        int    `yaml:"timeout_seconds"`
+	ProxyURL              string `yaml:"proxy_url"`
 }
 
 type LogConfig struct {

@@ -16,7 +16,8 @@ func sendGroupChatSummaries(ctx context.Context, notifier *telegram.Client, summ
 				MediaPaths: entry.MediaPaths,
 			})
 		}
-		if err := notifier.SendGroupChatSummary(ctx, summary.Header, entries); err != nil {
+		header := "#群聊\n" + summary.Header
+		if err := notifier.SendGroupChatSummary(ctx, header, entries); err != nil {
 			return err
 		}
 	}

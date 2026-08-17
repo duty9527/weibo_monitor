@@ -76,6 +76,9 @@ func buildSenderSummaries(
 		if !matchesTargetSender(record.Sender, filters) {
 			continue
 		}
+		if record.MsgType == "system" {
+			continue
+		}
 		grouped[record.Sender] = append(grouped[record.Sender], record)
 	}
 	if len(grouped) == 0 {
@@ -193,13 +196,12 @@ func summaryLineTime(record OutputRecord) string {
 
 func summaryLineText(record OutputRecord) string {
 	text := normalizeInlineText(record.Message)
-	// if len(splitMediaPaths(record.DownloadedMedia)) > 0 || record.HasImage {
-	// if text == "" {
-	// 	return "[图片]"
-	// }
-	// return text + "[图片]"
-
-	// }
+	if len(splitMediaPaths(record.DownloadedMedia)) > 0 || record.HasImage {
+		if text == "" {
+			return "[图片]"
+		}
+		return text + "[图片]"
+	}
 	if text == "" {
 		return "[空消息]"
 	}

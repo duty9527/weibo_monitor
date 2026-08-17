@@ -1,5 +1,5 @@
 browser:
-  user_data_dir: "../weibo_user_data"
+  user_data_dir: "../weibo_user_data/groupchat"
   browser_channel: "chrome"
   headless: false
   viewport_width: 1280
@@ -49,6 +49,7 @@ telegram:
   direct_messages_topic_id: 0
   enabled: false
   timeout_seconds: 30
+  proxy_url: ""
 
 log:
   level: "info"

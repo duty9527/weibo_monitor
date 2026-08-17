@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -100,54 +101,103 @@ func executeWeiboOnce(
 	if err != nil {
 		return err
 	}
-	if latestFetchedAt, ok := scraper.LatestFetchedTime(); ok {
-		state.SetLastFetchedTime(latestFetchedAt)
-		if err := weibo.SaveRunState(cfg.Weibo.StateFile, state); err != nil {
-			logger.Warn("写入最新抓取时间失败", "err", err)
-		} else {
-			cfg.Weibo.SinceTime = latestFetchedAt.In(time.Local).Format(time.RFC3339)
+
+	// 1. 抓到新博文立即全部落盘并保存抓取水位线
+	if len(records) > 0 {
+		for _, record := range records {
+			if err := scraper.AppendRecord(record); err != nil {
+				return fmt.Errorf("保存微博 %s 失败: %w", record.ID, err)
+			}
+			logger.Info("微博落盘成功", "id", record.ID)
+		}
+
+		if latestFetchedAt, ok := scraper.LatestFetchedTime(); ok {
+			state.SetLastFetchedTime(latestFetchedAt)
+			if err := weibo.SaveRunState(cfg.Weibo.StateFile, state); err != nil {
+				logger.Warn("写入最新抓取时间失败", "err", err)
+			} else {
+				cfg.Weibo.SinceTime = latestFetchedAt.In(time.Local).Format(time.RFC3339)
+			}
 		}
 	}
-	if len(records) == 0 {
-		logger.Info("本轮没有发现新微博")
-		return nil
-	}
 
-	for _, record := range records {
-		if notifier.Enabled() {
-			sendRecord, newMediaKeys, err := weibo.FilterSentMedia(record, state)
+	// 2. 推送阶段：读取本地历史做断点补偿发送
+	if notifier.Enabled() {
+		historyRecords, err := weibo.LoadLocalHistoryRecords(cfg.Weibo.HistoryFile)
+		if err != nil {
+			return fmt.Errorf("加载本地微博历史失败: %w", err)
+		}
+
+		lastPushedTime, hasPushed := state.LastPushedTime()
+
+		var toPush []*weibo.WeiboRecord
+		for _, rec := range historyRecords {
+			recTime, err := weibo.ParseWeiboTime(rec.CreatedAt)
 			if err != nil {
-				return fmt.Errorf("过滤微博 %s 的已发送媒体失败: %w", record.ID, err)
+				continue
 			}
-
-			skippedMediaCount := len(record.LocalMediaPaths) - len(sendRecord.LocalMediaPaths)
-			sendRecord.SkippedMediaCount = skippedMediaCount
-			if skippedMediaCount > 0 {
-				logger.Info(
-					"检测到已发送媒体，发送时跳过",
-					"id", record.ID,
-					"media_total", len(record.LocalMediaPaths),
-					"media_skipped", skippedMediaCount,
-				)
+			if !hasPushed || recTime.After(lastPushedTime) {
+				toPush = append(toPush, rec)
 			}
+		}
 
-			logger.Info("推送微博到 Telegram", "id", record.ID, "media_to_send", len(sendRecord.LocalMediaPaths))
-			if err := notifier.SendRecord(ctx, sendRecord); err != nil {
-				return fmt.Errorf("推送微博 %s 失败: %w", record.ID, err)
-			}
+		if len(toPush) > 0 {
+			// 按 CreatedAt 从旧到新排序
+			sort.Slice(toPush, func(i, j int) bool {
+				tI, _ := weibo.ParseWeiboTime(toPush[i].CreatedAt)
+				tJ, _ := weibo.ParseWeiboTime(toPush[j].CreatedAt)
+				return tI.Before(tJ)
+			})
 
-			if len(newMediaKeys) > 0 {
-				state.MarkMediaSent(newMediaKeys)
-				if err := weibo.SaveRunState(cfg.Weibo.StateFile, state); err != nil {
-					logger.Warn("写入媒体发送状态失败", "id", record.ID, "err", err)
+			for _, record := range toPush {
+				sendRecord, newMediaKeys, err := weibo.FilterSentMedia(record, state)
+				if err != nil {
+					return fmt.Errorf("过滤微博 %s 的已发送媒体失败: %w", record.ID, err)
+				}
+
+				skippedMediaCount := len(record.LocalMediaPaths) - len(sendRecord.LocalMediaPaths)
+				sendRecord.SkippedMediaCount = skippedMediaCount
+				if skippedMediaCount > 0 {
+					logger.Info(
+						"检测到已发送媒体，发送时跳过",
+						"id", record.ID,
+						"media_total", len(record.LocalMediaPaths),
+						"media_skipped", skippedMediaCount,
+					)
+				}
+
+				logger.Info("推送微博到 Telegram", "id", record.ID, "media_to_send", len(sendRecord.LocalMediaPaths))
+				if err := notifier.SendRecord(ctx, sendRecord); err != nil {
+					return fmt.Errorf("推送微博 %s 失败: %w", record.ID, err)
+				}
+
+				if len(newMediaKeys) > 0 {
+					state.MarkMediaSent(newMediaKeys)
+				}
+
+				// 发送成功，更新推送水位线并保存
+				if t, err := weibo.ParseWeiboTime(record.CreatedAt); err == nil {
+					state.SetLastPushedTime(t)
+					if err := weibo.SaveRunState(cfg.Weibo.StateFile, state); err != nil {
+						logger.Warn("更新微博推送水位状态失败", "err", err)
+					}
 				}
 			}
+			logger.Info("微博推送完成", "sent_count", len(toPush))
+		} else {
+			logger.Info("没有新微博需要推送")
+			// 兜底对齐
+			if latestFetchedAt, ok := scraper.LatestFetchedTime(); ok {
+				state.SetLastPushedTime(latestFetchedAt)
+				_ = weibo.SaveRunState(cfg.Weibo.StateFile, state)
+			}
 		}
-
-		if err := scraper.AppendRecord(record); err != nil {
-			return fmt.Errorf("保存微博 %s 失败: %w", record.ID, err)
+	} else {
+		// 未开启通知时，自动向前对齐推送水位
+		if latestFetchedAt, ok := scraper.LatestFetchedTime(); ok {
+			state.SetLastPushedTime(latestFetchedAt)
+			_ = weibo.SaveRunState(cfg.Weibo.StateFile, state)
 		}
-		logger.Info("微博处理完成", "id", record.ID)
 	}
 
 	logger.Info("微博任务完成", "new_count", len(records))
