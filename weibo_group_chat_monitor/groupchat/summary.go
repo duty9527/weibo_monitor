@@ -19,9 +19,45 @@ type SenderSummaryEntry struct {
 }
 
 func BuildSenderSummaries(now time.Time, records []OutputRecord, filters []string) []SenderSummary {
-	return buildSenderSummaries(records, filters, func(sender string, senderRecords []OutputRecord) string {
-		return FormatSenderSummaryHeader(now, sender, len(senderRecords))
-	})
+	groupedByDate := make(map[string]map[string][]OutputRecord)
+	for _, record := range records {
+		if !matchesTargetSender(record.Sender, filters) {
+			continue
+		}
+
+		date := senderSummaryDate(now, record).Format("2006-01-02")
+		if groupedByDate[date] == nil {
+			groupedByDate[date] = make(map[string][]OutputRecord)
+		}
+		groupedByDate[date][record.Sender] = append(groupedByDate[date][record.Sender], record)
+	}
+
+	dates := make([]string, 0, len(groupedByDate))
+	for date := range groupedByDate {
+		dates = append(dates, date)
+	}
+	sort.Strings(dates)
+
+	summaries := make([]SenderSummary, 0)
+	for _, date := range dates {
+		dateValue, _ := time.ParseInLocation("2006-01-02", date, time.Local)
+		senders := make([]string, 0, len(groupedByDate[date]))
+		for sender := range groupedByDate[date] {
+			senders = append(senders, sender)
+		}
+		sort.Strings(senders)
+
+		for _, sender := range senders {
+			senderRecords := append([]OutputRecord(nil), groupedByDate[date][sender]...)
+			sortOutputRecords(senderRecords)
+			summaries = append(summaries, newSenderSummary(
+				sender,
+				senderRecords,
+				FormatSenderSummaryHeader(dateValue, sender, len(senderRecords)),
+			))
+		}
+	}
+	return summaries
 }
 
 func BuildLocalHistorySenderSummaries(records []OutputRecord, filters []string) []SenderSummary {
@@ -56,20 +92,34 @@ func buildSenderSummaries(
 	for _, sender := range senders {
 		senderRecords := append([]OutputRecord(nil), grouped[sender]...)
 		sortOutputRecords(senderRecords)
-		entries := make([]SenderSummaryEntry, 0, len(senderRecords))
-		for _, record := range senderRecords {
-			entries = append(entries, SenderSummaryEntry{
-				Text:       formatSenderSummaryEntry(record),
-				MediaPaths: splitMediaPaths(record.DownloadedMedia),
-			})
-		}
-		summaries = append(summaries, SenderSummary{
-			Sender:  sender,
-			Header:  headerFn(sender, senderRecords),
-			Entries: entries,
-		})
+		summaries = append(summaries, newSenderSummary(sender, senderRecords, headerFn(sender, senderRecords)))
 	}
 	return summaries
+}
+
+func newSenderSummary(sender string, records []OutputRecord, header string) SenderSummary {
+	entries := make([]SenderSummaryEntry, 0, len(records))
+	for _, record := range records {
+		entries = append(entries, SenderSummaryEntry{
+			Text:       formatSenderSummaryEntry(record),
+			MediaPaths: splitMediaPaths(record.DownloadedMedia),
+		})
+	}
+	return SenderSummary{
+		Sender:  sender,
+		Header:  header,
+		Entries: entries,
+	}
+}
+
+func senderSummaryDate(now time.Time, record OutputRecord) time.Time {
+	if parsed, ok := record.ParsedTime(); ok {
+		return parsed.In(time.Local)
+	}
+	if parsed, ok := parseDateOnly(strings.TrimSpace(record.Date)); ok {
+		return parsed
+	}
+	return now.In(time.Local)
 }
 
 func BuildSenderSummaryMessages(now time.Time, records []OutputRecord, filters []string) []string {

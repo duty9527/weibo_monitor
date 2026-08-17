@@ -94,6 +94,63 @@ func TestBuildSenderSummariesCollectsMediaPaths(t *testing.T) {
 	}
 }
 
+func TestBuildSenderSummariesSplitsDatesAndSortsOldestFirst(t *testing.T) {
+	now := time.Date(2026, 8, 17, 23, 0, 0, 0, time.Local)
+	records := []OutputRecord{
+		{
+			ID:      "3",
+			Time:    "2026-08-17 09:00:00",
+			Sender:  "alice",
+			Message: "今天",
+		},
+		{
+			ID:      "2",
+			Time:    "2026-08-15 10:00:00",
+			Sender:  "alice",
+			Message: "旧消息二",
+		},
+		{
+			ID:      "1",
+			Time:    "2026-08-15 08:00:00",
+			Sender:  "alice",
+			Message: "旧消息一",
+		},
+	}
+
+	summaries := BuildSenderSummaries(now, records, []string{"alice"})
+	if len(summaries) != 2 {
+		t.Fatalf("expected 2 date summaries, got %d", len(summaries))
+	}
+	if !strings.Contains(summaries[0].Header, "2026年08月15日") {
+		t.Fatalf("expected oldest date first, got %q", summaries[0].Header)
+	}
+	if len(summaries[0].Entries) != 2 {
+		t.Fatalf("expected 2 entries for oldest date, got %d", len(summaries[0].Entries))
+	}
+	if summaries[0].Entries[0].Text != "08:00:00 旧消息一" || summaries[0].Entries[1].Text != "10:00:00 旧消息二" {
+		t.Fatalf("oldest date entries are not chronological: %#v", summaries[0].Entries)
+	}
+	if !strings.Contains(summaries[1].Header, "2026年08月17日") {
+		t.Fatalf("expected newest date last, got %q", summaries[1].Header)
+	}
+}
+
+func TestBuildSenderSummariesSortsDatesBeforeSenders(t *testing.T) {
+	now := time.Date(2026, 8, 17, 23, 0, 0, 0, time.Local)
+	records := []OutputRecord{
+		{ID: "2", Time: "2026-08-17 08:00:00", Sender: "alice", Message: "newer"},
+		{ID: "1", Time: "2026-08-16 08:00:00", Sender: "zoe", Message: "older"},
+	}
+
+	summaries := BuildSenderSummaries(now, records, []string{"alice", "zoe"})
+	if len(summaries) != 2 {
+		t.Fatalf("expected 2 summaries, got %d", len(summaries))
+	}
+	if summaries[0].Sender != "zoe" || summaries[1].Sender != "alice" {
+		t.Fatalf("expected date order before sender order, got %q then %q", summaries[0].Sender, summaries[1].Sender)
+	}
+}
+
 func TestBuildLocalHistorySenderSummariesUsesHistoryHeader(t *testing.T) {
 	records := []OutputRecord{
 		{

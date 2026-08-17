@@ -509,24 +509,24 @@ func (s *Scraper) downloadByFID(fid string) (string, error) {
 		return path, nil
 	}
 
-	downloadURL := fmt.Sprintf(
-		"https://upload.api.weibo.com/2/mss/msget?fid=%s&source=%s&imageType=origin&ts=%d",
-		fid,
-		s.cfg.Chat.Source,
-		time.Now().UnixMilli(),
-	)
+	candidateURLs := s.fidDownloadCandidateURLs(fid)
+	if directPath, err := s.downloadByFIDViaDirectHTTP(fid, path, candidateURLs); err == nil {
+		return directPath, nil
+	} else {
+		s.logger.Warn("直接 HTTP 下载 fid 全部失败，尝试浏览器下载", "fid", fid, "err", err)
+	}
 
 	response, err := s.page.ExpectResponse(func(url string) bool {
 		return strings.Contains(url, "msget") && strings.Contains(url, fid)
 	}, func() error {
 		_, err := s.page.Evaluate(`
 			url => {
-			const img = document.createElement("img");
-			img.src = url;
-			img.style.display = "none";
-			document.body.appendChild(img);
-		}
-		`, downloadURL)
+				const img = document.createElement("img");
+				img.src = url;
+				img.style.display = "none";
+				document.body.appendChild(img);
+			}
+		`, candidateURLs[0])
 		return err
 	}, playwright.PageExpectResponseOptions{Timeout: timeoutMillisPointer(s.cfg.Chat.ImageResponseTimeoutSeconds)})
 	if err != nil {
@@ -571,8 +571,7 @@ func (s *Scraper) downloadByFIDViaBrowserFetch(fid, path string) (string, error)
 	if lastErr == nil {
 		lastErr = fmt.Errorf("all candidate msget urls failed")
 	}
-	s.logger.Warn("浏览器内 fid 下载全部失败，尝试直接 HTTP 下载", "fid", fid, "err", lastErr)
-	return s.downloadByFIDViaDirectHTTP(fid, path, candidateURLs)
+	return "", lastErr
 }
 
 func (s *Scraper) fidDownloadCandidateURLs(fid string) []string {
@@ -613,7 +612,7 @@ func (s *Scraper) downloadByFIDViaDirectHTTP(fid, path string, candidateURLs []s
 		if err := os.WriteFile(path, body, 0o644); err != nil {
 			return "", fmt.Errorf("写入 fid 媒体文件失败: %w", err)
 		}
-		s.logger.Info("fid 媒体已通过直接 HTTP 回退下载成功", "fid", fid, "path", path)
+		s.logger.Info("fid 媒体已通过直接 HTTP 下载成功", "fid", fid, "path", path)
 		return path, nil
 	}
 
