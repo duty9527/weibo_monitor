@@ -3,6 +3,7 @@ package telegram
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"mime"
@@ -13,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"weibo_group_chat_monitor/config"
 	"weibo_group_chat_monitor/weibo"
@@ -189,6 +191,58 @@ func TestSendMediaGroupSetsShowCaptionAboveMediaForAllItems(t *testing.T) {
 	}
 	if got[1].Caption != "" {
 		t.Fatalf("expected only first item to carry caption, got %#v", got[1])
+	}
+}
+
+func TestSendMediaGroupRetriesAfterNetworkFailure(t *testing.T) {
+	dir := t.TempDir()
+	first := filepath.Join(dir, "1.jpg")
+	second := filepath.Join(dir, "2.jpg")
+	if err := os.WriteFile(first, []byte("a"), 0o644); err != nil {
+		t.Fatalf("write first media: %v", err)
+	}
+	if err := os.WriteFile(second, []byte("b"), 0o644); err != nil {
+		t.Fatalf("write second media: %v", err)
+	}
+
+	attempts := 0
+	var delays []time.Duration
+	client := NewClient(config.TelegramConfig{
+		Enabled:               true,
+		ChatID:                "123",
+		RetryMaxAttempts:      3,
+		RetryInitialDelaySecs: 5,
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	client.retryWait = func(_ context.Context, delay time.Duration) error {
+		delays = append(delays, delay)
+		return nil
+	}
+	client.httpClient = &http.Client{
+		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			attempts++
+			if attempts == 1 {
+				return nil, errors.New("temporary timeout")
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader(`{"ok":true}`)),
+			}, nil
+		}),
+	}
+
+	err := client.sendMediaGroup(context.Background(), []mediaItem{
+		{Path: first, Type: "photo", Field: "photo"},
+		{Path: second, Type: "photo", Field: "photo"},
+	}, "caption")
+	if err != nil {
+		t.Fatalf("sendMediaGroup failed after retry: %v", err)
+	}
+	if attempts != 2 {
+		t.Fatalf("expected 2 attempts, got %d", attempts)
+	}
+	if len(delays) != 1 || delays[0] != 5*time.Second {
+		t.Fatalf("unexpected retry delays: %#v", delays)
 	}
 }
 

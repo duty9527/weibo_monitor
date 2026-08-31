@@ -13,7 +13,7 @@ import (
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
-	playwright "github.com/playwright-community/playwright-go"
+	playwright "github.com/mxschmitt/playwright-go"
 
 	"weibo_group_chat_monitor/config"
 )

@@ -1,0 +1,21 @@
+[Unit]
+Description=Weibo group chat realtime subscriber
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=YOUR_USER
+WorkingDirectory=/ABSOLUTE/PATH/TO/weibo_group_chat_monitor
+ExecStart=/ABSOLUTE/PATH/TO/weibo_group_chat_monitor/weibo_group_chat_monitor groupchat-subscribe -config /ABSOLUTE/PATH/TO/weibo_group_chat_monitor/config.groupchat.yaml
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20
+KillSignal=SIGTERM
+
+# Chromium 扫码窗口需要图形会话时，按实际环境设置 DISPLAY/XAUTHORITY。
+# Environment=DISPLAY=:0
+# Environment=XAUTHORITY=/home/YOUR_USER/.Xauthority
+
+[Install]
+WantedBy=multi-user.target

@@ -15,7 +15,7 @@ import (
 
 	"weibo_group_chat_monitor/config"
 
-	playwright "github.com/playwright-community/playwright-go"
+	playwright "github.com/mxschmitt/playwright-go"
 )
 
 var (

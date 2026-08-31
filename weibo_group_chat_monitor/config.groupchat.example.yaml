@@ -1,6 +1,8 @@
 browser:
   user_data_dir: "../weibo_user_data/groupchat"
   browser_channel: "chrome"
+  # 可选；留空时会按 browser_channel 自动查找系统 Chrome/Chromium
+  executable_path: ""
   headless: false
   viewport_width: 1280
   viewport_height: 800
@@ -18,6 +20,18 @@ chat:
   direct_download_timeout_seconds: 15
   retry_delay_milliseconds: 5000
   history_interval_milliseconds: 1500
+
+subscription:
+  # Playwright 登录成功后写入，文件权限自动设为 0600
+  cookie_cache_file: "groupchat_cookies.json"
+  # 保留原始订阅事件，便于审计和排查未知事件类型
+  event_log_file: "groupchat_events.jsonl"
+  # 已处理消息/撤回事件的持久化去重状态。
+  processed_state_file: "groupchat_subscription_state.json"
+  login_timeout_seconds: 180
+  retry_delay_seconds: 5
+  # web.im.weibo.com 的证书链在部分 Linux 环境无法验证；仅测试时开启
+  tls_insecure_skip_verify: false
 
 output:
   # 程序会在该路径所在目录下按天生成 YYYY-MM-DD.jsonl
@@ -49,6 +63,8 @@ telegram:
   direct_messages_topic_id: 0
   enabled: false
   timeout_seconds: 30
+  retry_max_attempts: 3
+  retry_initial_delay_seconds: 5
   proxy_url: ""
 
 log:

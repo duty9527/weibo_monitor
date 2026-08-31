@@ -19,6 +19,7 @@ type WeiboModeConfig struct {
 type GroupChatModeConfig struct {
 	Browser       BrowserConfig          `yaml:"browser"`
 	Chat          ChatConfig             `yaml:"chat"`
+	Subscription  SubscriptionConfig     `yaml:"subscription"`
 	Output        GroupChatOutputConfig  `yaml:"output"`
 	State         GroupChatStateConfig   `yaml:"state"`
 	Filters       GroupChatFilterConfig  `yaml:"filters"`
@@ -26,6 +27,15 @@ type GroupChatModeConfig struct {
 	StopCondition StopCondition          `yaml:"stop_condition"`
 	Telegram      TelegramConfig         `yaml:"telegram"`
 	Log           LogConfig              `yaml:"log"`
+}
+
+type SubscriptionConfig struct {
+	CookieCacheFile       string `yaml:"cookie_cache_file"`
+	EventLogFile          string `yaml:"event_log_file"`
+	ProcessedStateFile    string `yaml:"processed_state_file"`
+	LoginTimeoutSeconds   int    `yaml:"login_timeout_seconds"`
+	RetryDelaySeconds     int    `yaml:"retry_delay_seconds"`
+	TLSInsecureSkipVerify bool   `yaml:"tls_insecure_skip_verify"`
 }
 
 type WeiboConfig struct {
@@ -51,6 +61,7 @@ type WeiboConfig struct {
 type BrowserConfig struct {
 	UserDataDir               string `yaml:"user_data_dir"`
 	BrowserChannel            string `yaml:"browser_channel"`
+	ExecutablePath            string `yaml:"executable_path"`
 	Headless                  bool   `yaml:"headless"`
 	ViewportWidth             int    `yaml:"viewport_width"`
 	ViewportHeight            int    `yaml:"viewport_height"`
@@ -104,6 +115,8 @@ type TelegramConfig struct {
 	DirectMessagesTopicID int    `yaml:"direct_messages_topic_id"`
 	Enabled               bool   `yaml:"enabled"`
 	TimeoutSeconds        int    `yaml:"timeout_seconds"`
+	RetryMaxAttempts      int    `yaml:"retry_max_attempts"`
+	RetryInitialDelaySecs int    `yaml:"retry_initial_delay_seconds"`
 	ProxyURL              string `yaml:"proxy_url"`
 }
 
@@ -263,6 +276,21 @@ func (c *GroupChatModeConfig) validate() error {
 	if c.Chat.HistoryIntervalMilliseconds <= 0 {
 		c.Chat.HistoryIntervalMilliseconds = 1500
 	}
+	if strings.TrimSpace(c.Subscription.CookieCacheFile) == "" {
+		c.Subscription.CookieCacheFile = "groupchat_cookies.json"
+	}
+	if strings.TrimSpace(c.Subscription.EventLogFile) == "" {
+		c.Subscription.EventLogFile = "groupchat_events.jsonl"
+	}
+	if strings.TrimSpace(c.Subscription.ProcessedStateFile) == "" {
+		c.Subscription.ProcessedStateFile = "groupchat_subscription_state.json"
+	}
+	if c.Subscription.LoginTimeoutSeconds <= 0 {
+		c.Subscription.LoginTimeoutSeconds = 180
+	}
+	if c.Subscription.RetryDelaySeconds <= 0 {
+		c.Subscription.RetryDelaySeconds = 5
+	}
 
 	if strings.TrimSpace(c.Output.HistoryFile) == "" {
 		c.Output.HistoryFile = "clean_history.jsonl"
@@ -303,14 +331,24 @@ func (c *GroupChatModeConfig) validate() error {
 
 func (c *GroupChatModeConfig) resolvePaths(baseDir string) {
 	c.Browser.UserDataDir = resolvePath(baseDir, c.Browser.UserDataDir)
+	c.Browser.ExecutablePath = resolvePath(baseDir, c.Browser.ExecutablePath)
 	c.Output.HistoryFile = resolvePath(baseDir, c.Output.HistoryFile)
 	c.Output.MediaDir = resolvePath(baseDir, c.Output.MediaDir)
 	c.State.StateFile = resolvePath(baseDir, c.State.StateFile)
+	c.Subscription.CookieCacheFile = resolvePath(baseDir, c.Subscription.CookieCacheFile)
+	c.Subscription.EventLogFile = resolvePath(baseDir, c.Subscription.EventLogFile)
+	c.Subscription.ProcessedStateFile = resolvePath(baseDir, c.Subscription.ProcessedStateFile)
 }
 
 func validateCommon(telegram *TelegramConfig, log *LogConfig) error {
 	if telegram.TimeoutSeconds <= 0 {
 		telegram.TimeoutSeconds = 30
+	}
+	if telegram.RetryMaxAttempts <= 0 {
+		telegram.RetryMaxAttempts = 3
+	}
+	if telegram.RetryInitialDelaySecs <= 0 {
+		telegram.RetryInitialDelaySecs = 5
 	}
 	if telegram.Enabled {
 		if telegram.BotToken == "" || telegram.BotToken == "YOUR_BOT_TOKEN_HERE" {

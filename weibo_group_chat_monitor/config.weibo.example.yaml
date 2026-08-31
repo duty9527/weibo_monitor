@@ -24,6 +24,8 @@ telegram:
   direct_messages_topic_id: 0
   enabled: false
   timeout_seconds: 30
+  retry_max_attempts: 3
+  retry_initial_delay_seconds: 5
   proxy_url: ""
 
 log:

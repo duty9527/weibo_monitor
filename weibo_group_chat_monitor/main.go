@@ -22,6 +22,8 @@ func run(args []string) int {
 		return runWeiboMode(remaining)
 	case "groupchat":
 		return runGroupChatMode(remaining)
+	case "groupchat-subscribe":
+		return runGroupChatSubscribeMode(remaining)
 	case "groupchat-history":
 		return runGroupChatHistoryMode(remaining)
 	default:
@@ -62,6 +64,8 @@ func normalizeMode(value string) string {
 	switch value {
 	case "group_chat", "group-chat", "groupchat":
 		return "groupchat"
+	case "groupchat_subscribe", "groupchat-subscribe", "group-chat-subscribe", "subscribe":
+		return "groupchat-subscribe"
 	case "groupchat_history", "groupchat-history", "historypush", "groupchathistory":
 		return "groupchat-history"
 	default:
@@ -73,9 +77,11 @@ func usageText() string {
 	return `用法:
   go run . weibo -config config.weibo.yaml
   go run . groupchat -config config.groupchat.yaml
+  go run . groupchat-subscribe -config config.groupchat.yaml
   go run . groupchat-history -config config.groupchat.yaml
   go run . -mode=weibo
   go run . -mode=groupchat
+  go run . -mode=groupchat-subscribe
   go run . -mode=groupchat-history
 `
 }

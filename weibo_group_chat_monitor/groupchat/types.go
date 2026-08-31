@@ -71,6 +71,9 @@ type OutputRecord struct {
 	MentionedUsers  []string `json:"mentioned_users,omitempty"`
 	DownloadedMedia *string  `json:"downloaded_media"`
 	HasImage        bool     `json:"has_image,omitempty"`
+	Recalled        bool     `json:"recalled,omitempty"`
+	RecalledAt      string   `json:"recalled_at,omitempty"`
+	RecallText      string   `json:"recall_text,omitempty"`
 }
 
 type FailedMediaRecord struct {

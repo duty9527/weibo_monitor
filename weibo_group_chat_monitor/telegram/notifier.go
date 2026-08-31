@@ -23,9 +23,11 @@ import (
 )
 
 const (
-	textLimit       = 4096
-	captionLimit    = 1024
-	mediaGroupLimit = 10
+	textLimit                = 4096
+	captionLimit             = 1024
+	mediaGroupLimit          = 10
+	defaultRetryMaxAttempts  = 3
+	defaultRetryInitialDelay = 5 * time.Second
 )
 
 // Client 是一个最小可用的 Telegram Bot API 客户端。
@@ -33,6 +35,7 @@ type Client struct {
 	cfg        config.TelegramConfig
 	httpClient *http.Client
 	logger     *slog.Logger
+	retryWait  func(context.Context, time.Duration) error
 }
 
 type apiResponse struct {
@@ -80,8 +83,43 @@ func NewClient(cfg config.TelegramConfig, logger *slog.Logger) *Client {
 			Timeout:   time.Duration(cfg.TimeoutSeconds) * time.Second,
 			Transport: transport,
 		},
-		logger: logger,
+		logger:    logger,
+		retryWait: waitForRetry,
 	}
+}
+
+func waitForRetry(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func (c *Client) retryMaxAttempts() int {
+	if c.cfg.RetryMaxAttempts > 0 {
+		return c.cfg.RetryMaxAttempts
+	}
+	return defaultRetryMaxAttempts
+}
+
+func (c *Client) waitBeforeRetry(ctx context.Context, failedAttempt int) error {
+	delay := defaultRetryInitialDelay
+	if c.cfg.RetryInitialDelaySecs > 0 {
+		delay = time.Duration(c.cfg.RetryInitialDelaySecs) * time.Second
+	}
+	// failedAttempt 从 1 开始：第 1 次失败等待初始间隔，之后指数退避。
+	for i := 1; i < failedAttempt; i++ {
+		delay *= 2
+	}
+	if c.retryWait == nil {
+		return waitForRetry(ctx, delay)
+	}
+	return c.retryWait(ctx, delay)
 }
 
 // Enabled 返回通知是否启用。
@@ -508,7 +546,7 @@ func (c *Client) sendTextChunk(ctx context.Context, text string, enablePreview b
 	}
 	c.applyThreadValues(values)
 
-	maxRetries := 3
+	maxRetries := c.retryMaxAttempts()
 	var lastErr error
 	for i := 0; i < maxRetries; i++ {
 		req, err := http.NewRequestWithContext(
@@ -527,10 +565,8 @@ func (c *Client) sendTextChunk(ctx context.Context, text string, enablePreview b
 			lastErr = err
 			c.logger.Warn("发送 Telegram 文本消息失败，将进行重试...", "retry", i+1, "max", maxRetries, "err", err)
 			if i < maxRetries-1 {
-				select {
-				case <-ctx.Done():
-					return ctx.Err()
-				case <-time.After(15 * time.Second):
+				if err := c.waitBeforeRetry(ctx, i+1); err != nil {
+					return err
 				}
 			}
 			continue
@@ -542,10 +578,8 @@ func (c *Client) sendTextChunk(ctx context.Context, text string, enablePreview b
 			lastErr = err
 			c.logger.Warn("发送 Telegram 文本消息响应错误，将进行重试...", "retry", i+1, "max", maxRetries, "err", err)
 			if i < maxRetries-1 {
-				select {
-				case <-ctx.Done():
-					return ctx.Err()
-				case <-time.After(15 * time.Second):
+				if err := c.waitBeforeRetry(ctx, i+1); err != nil {
+					return err
 				}
 			}
 			continue
@@ -568,7 +602,7 @@ func (c *Client) sendMarkdownText(ctx context.Context, text string) error {
 	values.Set("disable_web_page_preview", "true")
 	c.applyThreadValues(values)
 
-	maxRetries := 3
+	maxRetries := c.retryMaxAttempts()
 	var lastErr error
 	for i := 0; i < maxRetries; i++ {
 		req, err := http.NewRequestWithContext(
@@ -587,10 +621,8 @@ func (c *Client) sendMarkdownText(ctx context.Context, text string) error {
 			lastErr = err
 			c.logger.Warn("发送 Telegram Markdown 文本消息失败，将进行重试...", "retry", i+1, "max", maxRetries, "err", err)
 			if i < maxRetries-1 {
-				select {
-				case <-ctx.Done():
-					return ctx.Err()
-				case <-time.After(15 * time.Second):
+				if err := c.waitBeforeRetry(ctx, i+1); err != nil {
+					return err
 				}
 			}
 			continue
@@ -602,10 +634,8 @@ func (c *Client) sendMarkdownText(ctx context.Context, text string) error {
 			lastErr = err
 			c.logger.Warn("发送 Telegram Markdown 文本消息响应错误，将进行重试...", "retry", i+1, "max", maxRetries, "err", err)
 			if i < maxRetries-1 {
-				select {
-				case <-ctx.Done():
-					return ctx.Err()
-				case <-time.After(15 * time.Second):
+				if err := c.waitBeforeRetry(ctx, i+1); err != nil {
+					return err
 				}
 			}
 			continue
@@ -711,7 +741,7 @@ func (c *Client) sendSingleMediaWithMessageIDAs(ctx context.Context, item mediaI
 	reqBody := body.Bytes()
 	contentType := writer.FormDataContentType()
 
-	maxRetries := 3
+	maxRetries := c.retryMaxAttempts()
 	var lastErr error
 	for i := 0; i < maxRetries; i++ {
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.apiURL(method), bytes.NewReader(reqBody))
@@ -725,10 +755,8 @@ func (c *Client) sendSingleMediaWithMessageIDAs(ctx context.Context, item mediaI
 			lastErr = err
 			c.logger.Warn("发送 Telegram 媒体失败，将进行重试...", "retry", i+1, "max", maxRetries, "err", err)
 			if i < maxRetries-1 {
-				select {
-				case <-ctx.Done():
-					return 0, ctx.Err()
-				case <-time.After(15 * time.Second):
+				if err := c.waitBeforeRetry(ctx, i+1); err != nil {
+					return 0, err
 				}
 			}
 			continue
@@ -750,10 +778,8 @@ func (c *Client) sendSingleMediaWithMessageIDAs(ctx context.Context, item mediaI
 			lastErr = err
 			c.logger.Warn("发送 Telegram 媒体响应错误，将进行重试...", "retry", i+1, "max", maxRetries, "err", err)
 			if i < maxRetries-1 {
-				select {
-				case <-ctx.Done():
-					return 0, ctx.Err()
-				case <-time.After(15 * time.Second):
+				if err := c.waitBeforeRetry(ctx, i+1); err != nil {
+					return 0, err
 				}
 			}
 			continue
@@ -824,7 +850,7 @@ func (c *Client) sendMediaGroup(ctx context.Context, items []mediaItem, caption 
 	reqBody := body.Bytes()
 	contentType := writer.FormDataContentType()
 
-	maxRetries := 3
+	maxRetries := c.retryMaxAttempts()
 	var lastErr error
 	for i := 0; i < maxRetries; i++ {
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.apiURL("sendMediaGroup"), bytes.NewReader(reqBody))
@@ -838,10 +864,8 @@ func (c *Client) sendMediaGroup(ctx context.Context, items []mediaItem, caption 
 			lastErr = err
 			c.logger.Warn("发送 Telegram 图集失败，将进行重试...", "retry", i+1, "max", maxRetries, "err", err)
 			if i < maxRetries-1 {
-				select {
-				case <-ctx.Done():
-					return ctx.Err()
-				case <-time.After(15 * time.Second):
+				if err := c.waitBeforeRetry(ctx, i+1); err != nil {
+					return err
 				}
 			}
 			continue
@@ -873,10 +897,8 @@ func (c *Client) sendMediaGroup(ctx context.Context, items []mediaItem, caption 
 			lastErr = groupErr
 			c.logger.Warn("发送 Telegram 图集响应错误，将进行重试...", "retry", i+1, "max", maxRetries, "err", groupErr)
 			if i < maxRetries-1 {
-				select {
-				case <-ctx.Done():
-					return ctx.Err()
-				case <-time.After(15 * time.Second):
+				if err := c.waitBeforeRetry(ctx, i+1); err != nil {
+					return err
 				}
 			}
 			continue
@@ -951,7 +973,7 @@ func (c *Client) editMessageCaptionMarkdown(ctx context.Context, messageID int, 
 	values.Set("show_caption_above_media", "true")
 	c.applyThreadValues(values)
 
-	maxRetries := 3
+	maxRetries := c.retryMaxAttempts()
 	var lastErr error
 	for i := 0; i < maxRetries; i++ {
 		req, err := http.NewRequestWithContext(
@@ -970,10 +992,8 @@ func (c *Client) editMessageCaptionMarkdown(ctx context.Context, messageID int, 
 			lastErr = err
 			c.logger.Warn("编辑 Telegram Markdown caption 失败，将进行重试...", "retry", i+1, "max", maxRetries, "err", err)
 			if i < maxRetries-1 {
-				select {
-				case <-ctx.Done():
-					return ctx.Err()
-				case <-time.After(15 * time.Second):
+				if err := c.waitBeforeRetry(ctx, i+1); err != nil {
+					return err
 				}
 			}
 			continue
@@ -985,10 +1005,8 @@ func (c *Client) editMessageCaptionMarkdown(ctx context.Context, messageID int, 
 			lastErr = err
 			c.logger.Warn("编辑 Telegram Markdown caption 响应错误，将进行重试...", "retry", i+1, "max", maxRetries, "err", err)
 			if i < maxRetries-1 {
-				select {
-				case <-ctx.Done():
-					return ctx.Err()
-				case <-time.After(15 * time.Second):
+				if err := c.waitBeforeRetry(ctx, i+1); err != nil {
+					return err
 				}
 			}
 			continue

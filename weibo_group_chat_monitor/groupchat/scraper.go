@@ -16,7 +16,7 @@ import (
 
 	"weibo_group_chat_monitor/config"
 
-	playwright "github.com/playwright-community/playwright-go"
+	playwright "github.com/mxschmitt/playwright-go"
 )
 
 type Scraper struct {
@@ -272,15 +272,16 @@ func (s *Scraper) prepareOutput() error {
 
 func (s *Scraper) startBrowser() error {
 	runOptions := &playwright.RunOptions{
-		Browsers: []string{"chromium"},
-		Verbose:  false,
-		Stdout:   io.Discard,
-		Stderr:   os.Stderr,
+		Browsers:            []string{"chromium"},
+		SkipInstallBrowsers: true,
+		Verbose:             false,
+		Stdout:              io.Discard,
+		Stderr:              os.Stderr,
 	}
 
 	pw, err := playwright.Run(runOptions)
 	if err != nil {
-		s.logger.Info("Playwright driver/browser 未就绪，开始安装 Chromium")
+		s.logger.Info("Playwright driver 未就绪，开始安装")
 		if installErr := playwright.Install(runOptions); installErr != nil {
 			return fmt.Errorf("安装 Playwright 失败: %w", installErr)
 		}
@@ -299,7 +300,11 @@ func (s *Scraper) startBrowser() error {
 			Height: s.cfg.Browser.ViewportHeight,
 		},
 	}
-	if channel := strings.TrimSpace(s.cfg.Browser.BrowserChannel); channel != "" {
+	executablePath, channel := browserLaunchTarget(s.cfg.Browser)
+	if executablePath != "" {
+		launchOptions.ExecutablePath = playwright.String(executablePath)
+		s.logger.Info("使用系统浏览器启动 Playwright", "executable", executablePath)
+	} else if channel != "" {
 		launchOptions.Channel = playwright.String(channel)
 	}
 
