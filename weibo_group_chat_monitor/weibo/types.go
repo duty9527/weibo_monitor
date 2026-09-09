@@ -14,7 +14,7 @@ type WeiboRecord struct {
 	MediaURLs         []string `json:"media_urls"`
 	LocalMediaPaths   []string `json:"local_media_paths"`
 	IsRetweet         bool     `json:"is_retweet"`
-	FailedMediaURLs   []string `json:"-"`
+	FailedMediaURLs   []string `json:"failed_media_urls,omitempty"`
 	SkippedMediaCount int      `json:"-"`
 }
 
@@ -28,6 +28,7 @@ type WeiboItem struct {
 	PicIDs          []string           `json:"pic_ids"`
 	PicInfos        map[string]PicInfo `json:"pic_infos"`
 	PageInfo        *PageInfo          `json:"page_info"`
+	MixMediaInfo    json.RawMessage    `json:"mix_media_info"`
 	RetweetedStatus *WeiboItem         `json:"retweeted_status"`
 	User            *WeiboUser         `json:"user"`
 }
@@ -52,9 +53,14 @@ type PageInfo struct {
 }
 
 type MediaInfo struct {
-	MP4720P   string `json:"mp4_720p_mp4"`
-	MP4SdURL  string `json:"mp4_sd_url"`
-	StreamURL string `json:"stream_url"`
+	MP4720P     string `json:"mp4_720p_mp4"`
+	MP4HDURL    string `json:"mp4_hd_url"`
+	StreamURLHD string `json:"stream_url_hd"`
+	MP4SdURL    string `json:"mp4_sd_url"`
+	StreamURL   string `json:"stream_url"`
+	H265MP4HD   string `json:"h265_mp4_hd"`
+	H265MP4LD   string `json:"h265_mp4_ld"`
+	HEVCMP4720P string `json:"hevc_mp4_720p"`
 }
 
 // APIResponse 微博列表 API 响应结构

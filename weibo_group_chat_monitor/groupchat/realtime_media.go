@@ -2,6 +2,7 @@ package groupchat
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -14,6 +15,8 @@ import (
 
 	"weibo_group_chat_monitor/config"
 )
+
+var ErrMediaAuthentication = errors.New("微博媒体下载认证失效")
 
 type MediaDownloadFailure struct {
 	MediaType string
@@ -107,7 +110,7 @@ func (d *RealtimeMediaDownloader) downloadFID(fid string) (string, error) {
 
 	var lastErr error
 	for _, candidate := range d.fidCandidateURLs(fid) {
-		if _, err := d.downloadURLToPath(candidate, path, "https://api.weibo.com/chat/"); err == nil {
+		if _, err := d.downloadURLToPath(candidate, path, "https://api.weibo.com/chat/", true); err == nil {
 			return path, nil
 		} else {
 			lastErr = err
@@ -174,10 +177,10 @@ func (d *RealtimeMediaDownloader) downloadURL(mediaURL, filename, referer string
 	if _, err := os.Stat(path); err == nil {
 		return path, nil
 	}
-	return d.downloadURLToPath(mediaURL, path, referer)
+	return d.downloadURLToPath(mediaURL, path, referer, false)
 }
 
-func (d *RealtimeMediaDownloader) downloadURLToPath(mediaURL, path, referer string) (string, error) {
+func (d *RealtimeMediaDownloader) downloadURLToPath(mediaURL, path, referer string, allowDocument bool) (string, error) {
 	body, contentType, err := d.fetch(mediaURL, referer)
 	if err != nil {
 		return "", err
@@ -187,7 +190,12 @@ func (d *RealtimeMediaDownloader) downloadURLToPath(mediaURL, path, referer stri
 	}
 	lowerContentType := strings.ToLower(contentType)
 	if strings.HasPrefix(lowerContentType, "text/") || strings.Contains(lowerContentType, "application/json") {
-		return "", fmt.Errorf("媒体响应类型异常: %s", contentType)
+		if isMediaAuthenticationErrorText(string(body)) {
+			return "", fmt.Errorf("%w: %s", ErrMediaAuthentication, strings.TrimSpace(string(body)))
+		}
+		if !allowDocument {
+			return "", fmt.Errorf("媒体响应类型异常: %s", contentType)
+		}
 	}
 	if filepath.Ext(path) == ".file" {
 		if extensions, _ := mime.ExtensionsByType(strings.Split(contentType, ";")[0]); len(extensions) > 0 {
@@ -214,6 +222,31 @@ func (d *RealtimeMediaDownloader) downloadURLToPath(mediaURL, path, referer stri
 		return "", err
 	}
 	return path, nil
+}
+
+func HasMediaAuthenticationFailure(failures []MediaDownloadFailure) bool {
+	for _, failure := range failures {
+		if errors.Is(failure.Err, ErrMediaAuthentication) || isMediaAuthenticationErrorText(errorString(failure.Err)) {
+			return true
+		}
+	}
+	return false
+}
+
+func isMediaAuthenticationErrorText(value string) bool {
+	value = strings.ToLower(strings.TrimSpace(value))
+	return strings.Contains(value, "sub invalid") ||
+		strings.Contains(value, "cookie expires or invalid") ||
+		strings.Contains(value, "auth failed") ||
+		strings.Contains(value, "unauthorized") ||
+		strings.Contains(value, "http 401")
+}
+
+func errorString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }
 
 func (d *RealtimeMediaDownloader) fetch(target, referer string) ([]byte, string, error) {

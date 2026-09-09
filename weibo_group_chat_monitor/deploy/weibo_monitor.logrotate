@@ -1,0 +1,11 @@
+/home/duty/weibo_cron/logs/*.log {
+    weekly
+    rotate 12
+    maxsize 10M
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    su duty duty
+}

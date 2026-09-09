@@ -16,7 +16,13 @@ import (
 
 const DefaultBayeuxEndpoint = "https://web.im.weibo.com/im"
 
+const (
+	defaultBayeuxConnectTimeout = 90 * time.Second
+	bayeuxConnectTimeoutGrace   = 15 * time.Second
+)
+
 var ErrBayeuxReconnectNone = errors.New("服务端要求停止 Bayeux 重连")
+var ErrBayeuxHandshakeRequired = errors.New("服务端要求重新执行 Bayeux handshake")
 
 type BayeuxClient struct {
 	endpoint       string
@@ -26,6 +32,8 @@ type BayeuxClient struct {
 	messageID      int64
 	connectionType string
 	ack            json.RawMessage
+	connectTimeout time.Duration
+	serverTimeout  time.Duration
 }
 
 type BayeuxMessage struct {
@@ -80,7 +88,14 @@ func NewBayeuxClient(endpoint, cookieHeader string, httpClient *http.Client) (*B
 		httpClient:     httpClient,
 		origin:         "https://api.weibo.com",
 		connectionType: "long-polling",
+		connectTimeout: defaultBayeuxConnectTimeout,
 	}, nil
+}
+
+func (c *BayeuxClient) SetConnectTimeout(timeout time.Duration) {
+	if timeout > 0 {
+		c.connectTimeout = timeout
+	}
 }
 
 func (c *BayeuxClient) Handshake(ctx context.Context) (*BayeuxMessage, error) {
@@ -105,6 +120,7 @@ func (c *BayeuxClient) Handshake(ctx context.Context) (*BayeuxMessage, error) {
 	}
 	c.clientID = reply.ClientID
 	c.ack = initialAckValue(reply.Ext)
+	c.updateServerTimeout(reply.Advice)
 	return reply, nil
 }
 
@@ -145,7 +161,9 @@ func (c *BayeuxClient) Connect(ctx context.Context) ([]BayeuxMessage, error) {
 	if len(c.ack) > 0 {
 		request.Ext = buildAckExtension(c.ack)
 	}
-	messages, err := c.post(ctx, "connect", []BayeuxMessage{request})
+	connectCtx, cancel := context.WithTimeout(ctx, c.currentConnectTimeout())
+	defer cancel()
+	messages, err := c.post(connectCtx, "connect", []BayeuxMessage{request})
 	if err != nil {
 		return nil, err
 	}
@@ -156,10 +174,27 @@ func (c *BayeuxClient) Connect(ctx context.Context) ([]BayeuxMessage, error) {
 	if ack := ackValue(reply.Ext); len(ack) > 0 {
 		c.ack = ack
 	}
+	c.updateServerTimeout(reply.Advice)
 	if !reply.Successful {
 		return messages, fmt.Errorf("Bayeux connect 失败: %s", reply.Error)
 	}
 	return messages, nil
+}
+
+func (c *BayeuxClient) currentConnectTimeout() time.Duration {
+	if c.serverTimeout > 0 {
+		return c.serverTimeout + bayeuxConnectTimeoutGrace
+	}
+	if c.connectTimeout > 0 {
+		return c.connectTimeout
+	}
+	return defaultBayeuxConnectTimeout
+}
+
+func (c *BayeuxClient) updateServerTimeout(advice *BayeuxAdvice) {
+	if advice != nil && advice.Timeout > 0 {
+		c.serverTimeout = time.Duration(advice.Timeout) * time.Millisecond
+	}
 }
 
 func (c *BayeuxClient) Listen(ctx context.Context, channel string, onMessage func(BayeuxMessage)) error {
@@ -190,6 +225,10 @@ func (c *BayeuxClient) Receive(ctx context.Context, channel string, onMessage fu
 		}
 		return nil
 	})
+}
+
+func (c *BayeuxClient) ReceiveWithError(ctx context.Context, channel string, onMessage func(BayeuxMessage) error) error {
+	return c.receive(ctx, channel, onMessage)
 }
 
 func (c *BayeuxClient) receive(ctx context.Context, channel string, onMessage func(BayeuxMessage) error) error {
@@ -260,13 +299,7 @@ func (c *BayeuxClient) handleReconnectAdvice(ctx context.Context, channel string
 		if err := sleepContext(ctx, interval); err != nil {
 			return true, nil
 		}
-		if _, err := c.Handshake(ctx); err != nil {
-			return true, err
-		}
-		if err := c.Subscribe(ctx, channel); err != nil {
-			return true, err
-		}
-		return true, nil
+		return true, ErrBayeuxHandshakeRequired
 	case "retry":
 		if err := sleepContext(ctx, interval); err != nil {
 			return true, nil

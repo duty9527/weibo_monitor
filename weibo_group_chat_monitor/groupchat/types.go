@@ -12,12 +12,15 @@ import (
 const outputTimeLayout = "2006-01-02 15:04:05"
 
 type ChatAPIResponse struct {
-	Messages []ChatMessage `json:"messages"`
+	Messages  []ChatMessage `json:"messages"`
+	Error     string        `json:"error"`
+	ErrorCode FlexibleInt64 `json:"error_code"`
 }
 
 type ChatMessage struct {
 	ID       FlexibleString      `json:"id"`
 	Time     FlexibleInt64       `json:"time"`
+	FromUID  FlexibleString      `json:"from_uid"`
 	FromUser *ChatUser           `json:"from_user"`
 	Text     string              `json:"text"`
 	Content  string              `json:"content"`
@@ -63,6 +66,7 @@ type OutputRecord struct {
 	Date            string   `json:"date"`
 	Hour            int      `json:"hour"`
 	Sender          string   `json:"sender"`
+	SenderUID       string   `json:"sender_uid,omitempty"`
 	Message         string   `json:"message"`
 	MsgType         string   `json:"msg_type"`
 	TextClean       string   `json:"text_clean"`

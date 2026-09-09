@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/http/cookiejar"
 	"os"
 	"path/filepath"
 	"strings"
@@ -33,11 +34,32 @@ type AuthSession struct {
 	Cookies []StoredCookie
 }
 
+type authRefreshState struct {
+	LastALFFingerprint string `json:"last_alf_fingerprint"`
+	LastAttemptAt      string `json:"last_attempt_at"`
+}
+
 func AcquireAuthSession(ctx context.Context, cfg *config.GroupChatModeConfig, logger *slog.Logger, forceBrowser bool) (*AuthSession, error) {
 	if !forceBrowser {
 		cookies, err := LoadStoredCookies(cfg.Subscription.CookieCacheFile)
 		if err == nil {
 			if session, err := validateStoredCookies(ctx, cookies); err == nil {
+				fingerprint, expiresAt, due := ALFProactiveRefreshDue(cookies, time.Now(), time.Duration(cfg.Subscription.ProactiveRefreshBeforeExpiryHours)*time.Hour)
+				if due {
+					claimed, claimErr := ClaimALFProactiveRefresh(cfg.Subscription.AuthRefreshStateFile, fingerprint, time.Now())
+					if claimErr != nil {
+						logger.Warn("记录 ALF 预刷新状态失败，将继续使用有效 Cookie", "err", claimErr)
+						return session, nil
+					}
+					if claimed {
+						logger.Info("ALF 即将过期，尝试一次无头 Playwright 预刷新", "expires_at", expiresAt.Format(time.RFC3339))
+						if refreshed, refreshErr := refreshStoredCookiesHeadless(ctx, cfg, logger); refreshErr == nil {
+							return refreshed, nil
+						} else {
+							logger.Warn("ALF 预刷新失败，将继续使用当前有效 Cookie", "err", refreshErr)
+						}
+					}
+				}
 				logger.Info("使用缓存 Cookie 建立订阅认证", "uid", session.UID, "cookie_file", cfg.Subscription.CookieCacheFile)
 				return session, nil
 			}
@@ -47,14 +69,8 @@ func AcquireAuthSession(ctx context.Context, cfg *config.GroupChatModeConfig, lo
 	}
 
 	logger.Info("尝试通过无头浏览器恢复微博登录态")
-	if cookies, err := extractCookiesWithPlaywright(ctx, cfg, logger, true, false); err == nil {
-		if session, err := validateStoredCookies(ctx, cookies); err == nil {
-			if err := SaveStoredCookies(cfg.Subscription.CookieCacheFile, cookies); err != nil {
-				return nil, err
-			}
-			logger.Info("已从持久化浏览器会话刷新 Cookie，浏览器即将关闭", "uid", session.UID)
-			return session, nil
-		}
+	if session, err := refreshStoredCookiesHeadless(ctx, cfg, logger); err == nil {
+		return session, nil
 	} else {
 		logger.Info("无头浏览器中没有有效登录态", "reason", err)
 	}
@@ -64,7 +80,7 @@ func AcquireAuthSession(ctx context.Context, cfg *config.GroupChatModeConfig, lo
 	if err != nil {
 		return nil, err
 	}
-	session, err := validateStoredCookies(ctx, cookies)
+	session, err := validateRefreshedCookies(ctx, cfg, cookies)
 	if err != nil {
 		return nil, err
 	}
@@ -73,6 +89,130 @@ func AcquireAuthSession(ctx context.Context, cfg *config.GroupChatModeConfig, lo
 	}
 	logger.Info("扫码登录成功，Cookie 已保存，浏览器即将关闭", "uid", session.UID, "cookie_file", cfg.Subscription.CookieCacheFile)
 	return session, nil
+}
+
+func refreshStoredCookiesHeadless(ctx context.Context, cfg *config.GroupChatModeConfig, logger *slog.Logger) (*AuthSession, error) {
+	cookies, err := extractCookiesWithPlaywright(ctx, cfg, logger, true, false)
+	if err != nil {
+		return nil, err
+	}
+	session, err := validateRefreshedCookies(ctx, cfg, cookies)
+	if err != nil {
+		return nil, err
+	}
+	if err := SaveStoredCookies(cfg.Subscription.CookieCacheFile, cookies); err != nil {
+		return nil, err
+	}
+	logger.Info("已从持久化浏览器会话刷新 Cookie，浏览器即将关闭", "uid", session.UID)
+	return session, nil
+}
+
+func validateRefreshedCookies(ctx context.Context, cfg *config.GroupChatModeConfig, cookies []StoredCookie) (*AuthSession, error) {
+	session, err := validateStoredCookies(ctx, cookies)
+	if err != nil {
+		return nil, err
+	}
+	checkCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	if err := ValidateBayeuxHandshake(checkCtx, cookies, cfg.Subscription.TLSInsecureSkipVerify); err != nil {
+		return nil, fmt.Errorf("刷新后的 Cookie 未通过 Bayeux 握手验证: %w", err)
+	}
+	return session, nil
+}
+
+func ValidateStoredCookies(ctx context.Context, cookies []StoredCookie) (*AuthSession, error) {
+	return validateStoredCookies(ctx, cookies)
+}
+
+func ValidateBayeuxHandshake(ctx context.Context, cookies []StoredCookie, insecure bool) error {
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		return err
+	}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	tlsConfig, err := NewWeiboIMTLSConfig(insecure)
+	if err != nil {
+		return err
+	}
+	transport.TLSClientConfig = tlsConfig
+	httpClient := &http.Client{Transport: transport, Jar: jar}
+	client, err := NewBayeuxClient(DefaultBayeuxEndpoint, CookieHeaderForHost(cookies, "web.im.weibo.com"), httpClient)
+	if err != nil {
+		return err
+	}
+	_, err = client.Handshake(ctx)
+	return err
+}
+
+func ALFProactiveRefreshDue(cookies []StoredCookie, now time.Time, before time.Duration) (string, time.Time, bool) {
+	if before <= 0 {
+		return "", time.Time{}, false
+	}
+	var expiresAt time.Time
+	var domain string
+	for _, cookie := range cookies {
+		if !strings.EqualFold(strings.TrimSpace(cookie.Name), "ALF") || cookie.Expires <= 0 {
+			continue
+		}
+		candidate := time.Unix(int64(cookie.Expires), 0)
+		if expiresAt.IsZero() || candidate.After(expiresAt) {
+			expiresAt = candidate
+			domain = strings.ToLower(strings.TrimSpace(cookie.Domain))
+		}
+	}
+	if expiresAt.IsZero() || expiresAt.After(now.Add(before)) {
+		return "", expiresAt, false
+	}
+	fingerprint := fmt.Sprintf("ALF|%s|%d", domain, expiresAt.Unix())
+	return fingerprint, expiresAt, true
+}
+
+func ClaimALFProactiveRefresh(path, fingerprint string, now time.Time) (bool, error) {
+	path = strings.TrimSpace(path)
+	if path == "" || fingerprint == "" {
+		return false, nil
+	}
+	var state authRefreshState
+	if data, err := os.ReadFile(path); err == nil {
+		if err := json.Unmarshal(data, &state); err != nil {
+			return false, fmt.Errorf("解析认证刷新状态失败: %w", err)
+		}
+	} else if !os.IsNotExist(err) {
+		return false, fmt.Errorf("读取认证刷新状态失败: %w", err)
+	}
+	if state.LastALFFingerprint == fingerprint {
+		return false, nil
+	}
+	state.LastALFFingerprint = fingerprint
+	state.LastAttemptAt = now.In(time.Local).Format(time.RFC3339)
+	data, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return false, err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return false, err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".auth-refresh-*")
+	if err != nil {
+		return false, err
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if err := tmp.Chmod(0o600); err != nil {
+		tmp.Close()
+		return false, err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return false, err
+	}
+	if err := tmp.Close(); err != nil {
+		return false, err
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func extractCookiesWithPlaywright(

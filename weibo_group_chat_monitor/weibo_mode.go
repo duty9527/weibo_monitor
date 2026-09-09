@@ -73,10 +73,6 @@ func executeWeiboOnce(
 		"telegram_enabled", cfg.Telegram.Enabled,
 	)
 
-	if err := maybeRefreshWeiboCookiesViaPlaywright(ctx, cfg, state, logger); err != nil {
-		logger.Warn("按计划刷新 Playwright Cookie 失败，将继续使用现有 Cookie", "err", err)
-	}
-
 	cookieStr, usedPlaywright, err := loadWeiboCookies(ctx, cfg, logger)
 	if err != nil {
 		return err
@@ -222,37 +218,6 @@ func loadWeiboCookies(ctx context.Context, cfg *config.WeiboModeConfig, logger *
 		return "", false, err
 	}
 	return result.CookieString, result.UsedPlaywright, nil
-}
-
-func maybeRefreshWeiboCookiesViaPlaywright(
-	ctx context.Context,
-	cfg *config.WeiboModeConfig,
-	state *weibo.RunState,
-	logger *slog.Logger,
-) error {
-	if strings.TrimSpace(cfg.Weibo.CookieString) != "" || strings.TrimSpace(cfg.Weibo.CookieFile) != "" {
-		return nil
-	}
-
-	refreshEvery := time.Duration(cfg.Weibo.PlaywrightRefreshHours) * time.Hour
-	if refreshEvery <= 0 {
-		return nil
-	}
-
-	lastRefresh, ok := state.LastPlaywrightRefreshTime()
-	if ok && time.Since(lastRefresh) < refreshEvery {
-		return nil
-	}
-
-	logger.Info("达到 Playwright Cookie 刷新时间，开始保活", "refresh_hours", cfg.Weibo.PlaywrightRefreshHours)
-
-	extractor := weibo.NewCookieExtractor(cfg.Weibo.UserDataDir, logger)
-	if _, err := extractor.RefreshViaPlaywright(ctx, cfg.Weibo); err != nil {
-		return err
-	}
-
-	state.SetLastPlaywrightRefreshTime(time.Now())
-	return weibo.SaveRunState(cfg.Weibo.StateFile, state)
 }
 
 func applyWeiboStateSinceTime(cfg *config.WeiboModeConfig, state *weibo.RunState, logger *slog.Logger) {

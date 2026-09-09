@@ -7,8 +7,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"mime"
 	"net/http"
+	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"time"
@@ -227,18 +230,16 @@ func (s *Scraper) extractText(ctx context.Context, item *WeiboItem) string {
 }
 
 func extractMedia(item *WeiboItem) []string {
+	if item == nil {
+		return nil
+	}
+
 	var urls []string
 
-	if item.PageInfo != nil && string(item.PageInfo.Type) == "video" && item.PageInfo.MediaInfo != nil {
-		mi := item.PageInfo.MediaInfo
-		switch {
-		case mi.MP4720P != "":
-			urls = append(urls, mi.MP4720P)
-		case mi.MP4SdURL != "":
-			urls = append(urls, mi.MP4SdURL)
-		case mi.StreamURL != "":
-			urls = append(urls, mi.StreamURL)
-		}
+	// 微博的视频 page_info.type 既可能是 "video"，也常见数字 5、11。
+	// media_info 的存在比 type 更稳定，因此不再依赖 type 判断。
+	if item.PageInfo != nil {
+		urls = append(urls, bestVideoURL(item.PageInfo.MediaInfo))
 	}
 
 	for _, pic := range item.PicInfos {
@@ -258,7 +259,117 @@ func extractMedia(item *WeiboItem) []string {
 		}
 	}
 
+	urls = append(urls, extractMixedMedia(item.MixMediaInfo)...)
+
 	return uniqueStrings(urls)
+}
+
+func bestVideoURL(mi *MediaInfo) string {
+	if mi == nil {
+		return ""
+	}
+	for _, candidate := range []string{
+		mi.MP4720P,
+		mi.MP4HDURL,
+		mi.StreamURLHD,
+		mi.MP4SdURL,
+		mi.StreamURL,
+		mi.HEVCMP4720P,
+		mi.H265MP4HD,
+		mi.H265MP4LD,
+	} {
+		if strings.TrimSpace(candidate) != "" {
+			return candidate
+		}
+	}
+	return ""
+}
+
+// extractMixedMedia 兼容 mix_media_info.items 中图文、视频混排的结构。
+// 该接口字段变化较频繁，因此仅在 mix_media_info 子树内递归识别明确的
+// 图片尺寸字段和视频地址字段，避免把头像、卡片链接误判成正文媒体。
+func extractMixedMedia(raw json.RawMessage) []string {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil
+	}
+
+	var value any
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return nil
+	}
+
+	var urls []string
+	var walk func(any)
+	walk = func(node any) {
+		switch v := node.(type) {
+		case []any:
+			for _, child := range v {
+				walk(child)
+			}
+		case map[string]any:
+			if videoURL := bestVideoURLFromContainer(v); videoURL != "" {
+				urls = append(urls, videoURL)
+				return
+			}
+
+			for _, size := range []string{"mw2000", "original", "large"} {
+				if imageURL := nestedString(v, size, "url"); imageURL != "" {
+					urls = append(urls, imageURL)
+					return
+				}
+			}
+
+			for _, child := range v {
+				walk(child)
+			}
+		}
+	}
+	walk(value)
+	return uniqueStrings(urls)
+}
+
+func bestVideoURLFromContainer(value map[string]any) string {
+	if videoURL := bestVideoURLFromMap(value); videoURL != "" {
+		return videoURL
+	}
+	if mediaInfo, ok := value["media_info"].(map[string]any); ok {
+		if videoURL := bestVideoURLFromMap(mediaInfo); videoURL != "" {
+			return videoURL
+		}
+	}
+	if pageInfo, ok := value["page_info"].(map[string]any); ok {
+		if mediaInfo, ok := pageInfo["media_info"].(map[string]any); ok {
+			return bestVideoURLFromMap(mediaInfo)
+		}
+	}
+	return ""
+}
+
+func bestVideoURLFromMap(value map[string]any) string {
+	for _, key := range []string{
+		"mp4_720p_mp4",
+		"mp4_hd_url",
+		"stream_url_hd",
+		"mp4_sd_url",
+		"stream_url",
+		"hevc_mp4_720p",
+		"h265_mp4_hd",
+		"h265_mp4_ld",
+	} {
+		if candidate, ok := value[key].(string); ok && strings.TrimSpace(candidate) != "" {
+			return candidate
+		}
+	}
+	return ""
+}
+
+func nestedString(value map[string]any, objectKey, valueKey string) string {
+	nested, ok := value[objectKey].(map[string]any)
+	if !ok {
+		return ""
+	}
+	result, _ := nested[valueKey].(string)
+	return strings.TrimSpace(result)
 }
 
 func idStr(id interface{}) string {
@@ -298,17 +409,6 @@ func (s *Scraper) DownloadMedia(url string) string {
 		return ""
 	}
 
-	parts := strings.Split(strings.Split(url, "?")[0], "/")
-	filename := parts[len(parts)-1]
-	if filename == "" {
-		filename = fmt.Sprintf("media_%d.file", time.Now().UnixMilli())
-	}
-
-	fpath := filepath.Join(s.cfg.Weibo.MediaDir, filename)
-	if _, err := os.Stat(fpath); err == nil {
-		return fpath
-	}
-
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
 		s.logger.Error("下载失败", "url", url, "err", err)
@@ -332,18 +432,92 @@ func (s *Scraper) DownloadMedia(url string) string {
 		return ""
 	}
 
-	out, err := os.Create(fpath)
-	if err != nil {
-		s.logger.Error("创建文件失败", "path", fpath, "err", err)
+	filename := mediaFilename(url, resp.Header.Get("Content-Type"))
+	fpath := filepath.Join(s.cfg.Weibo.MediaDir, filename)
+	if _, err := os.Stat(fpath); err == nil {
+		return fpath
+	}
+
+	contentType := strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Type")))
+	if strings.HasPrefix(contentType, "text/html") || strings.HasPrefix(contentType, "application/json") {
+		s.logger.Error("下载失败，响应不是媒体文件", "url", url, "content_type", contentType)
 		return ""
 	}
-	defer out.Close()
+
+	out, err := os.CreateTemp(s.cfg.Weibo.MediaDir, ".media-*")
+	if err != nil {
+		s.logger.Error("创建临时媒体文件失败", "path", fpath, "err", err)
+		return ""
+	}
+	tempPath := out.Name()
+	keepTemp := false
+	defer func() {
+		out.Close()
+		if !keepTemp {
+			_ = os.Remove(tempPath)
+		}
+	}()
 
 	if _, err := io.Copy(out, resp.Body); err != nil {
 		s.logger.Error("写入文件失败", "path", fpath, "err", err)
 		return ""
 	}
+	if err := out.Close(); err != nil {
+		s.logger.Error("关闭媒体文件失败", "path", fpath, "err", err)
+		return ""
+	}
+	if err := os.Rename(tempPath, fpath); err != nil {
+		s.logger.Error("保存媒体文件失败", "path", fpath, "err", err)
+		return ""
+	}
+	keepTemp = true
 	return fpath
+}
+
+func mediaFilename(rawURL, contentType string) string {
+	filename := ""
+	if parsed, err := url.Parse(rawURL); err == nil {
+		filename = path.Base(parsed.Path)
+		if decoded, decodeErr := url.PathUnescape(filename); decodeErr == nil {
+			filename = decoded
+		}
+	}
+	if filename == "" || filename == "." || filename == "/" {
+		filename = fmt.Sprintf("media_%d", time.Now().UnixMilli())
+	}
+	filename = filepath.Base(filename)
+
+	extension := strings.ToLower(filepath.Ext(filename))
+	if isKnownMediaExtension(extension) {
+		return filename
+	}
+
+	if extensions, err := mime.ExtensionsByType(strings.TrimSpace(strings.Split(contentType, ";")[0])); err == nil && len(extensions) > 0 {
+		filename = strings.TrimSuffix(filename, filepath.Ext(filename)) + preferredMediaExtension(extensions)
+	} else if extension == "" {
+		filename += ".file"
+	}
+	return filename
+}
+
+func isKnownMediaExtension(extension string) bool {
+	switch extension {
+	case ".mp4", ".mov", ".m4v", ".jpg", ".jpeg", ".png", ".webp", ".gif":
+		return true
+	default:
+		return false
+	}
+}
+
+func preferredMediaExtension(extensions []string) string {
+	for _, preferred := range []string{".mp4", ".jpg", ".png", ".webp", ".mov"} {
+		for _, extension := range extensions {
+			if extension == preferred {
+				return extension
+			}
+		}
+	}
+	return extensions[0]
 }
 
 // FetchNewRecords 根据历史记录和时间节点抓取新的微博数据。

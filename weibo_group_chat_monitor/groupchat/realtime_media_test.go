@@ -1,6 +1,7 @@
 package groupchat
 
 import (
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -10,6 +11,21 @@ import (
 
 	"weibo_group_chat_monitor/config"
 )
+
+func TestHasMediaAuthenticationFailure(t *testing.T) {
+	for _, err := range []error{
+		ErrMediaAuthentication,
+		errors.New(`HTTP 403: {"error":"auth failed! sub invalid"}`),
+		errors.New("HTTP 401"),
+	} {
+		if !HasMediaAuthenticationFailure([]MediaDownloadFailure{{Err: err}}) {
+			t.Fatalf("expected authentication failure for %v", err)
+		}
+	}
+	if HasMediaAuthenticationFailure([]MediaDownloadFailure{{Err: errors.New("HTTP 404")}}) {
+		t.Fatal("ordinary media failure must not be classified as authentication failure")
+	}
+}
 
 func TestRealtimeMediaDownloaderDownloadsPagePicture(t *testing.T) {
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -50,6 +66,51 @@ func TestRealtimeMediaDownloaderDownloadsPagePicture(t *testing.T) {
 	}
 	if string(data) != "jpeg-data" {
 		t.Fatalf("unexpected media content: %q", data)
+	}
+}
+
+func TestRealtimeMediaDownloaderAllowsTextFIDDocument(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/csv;charset=utf-8")
+		_, _ = w.Write([]byte("name,value\nfoo,42\n"))
+	}))
+	defer server.Close()
+
+	dir := t.TempDir()
+	downloader := NewRealtimeMediaDownloader(&config.GroupChatModeConfig{
+		Chat:   config.ChatConfig{DirectDownloadTimeoutSeconds: 2},
+		Output: config.GroupChatOutputConfig{MediaDir: dir},
+	}, nil)
+	downloader.client = server.Client()
+	path := filepath.Join(dir, "report.csv")
+	got, err := downloader.downloadURLToPath(server.URL+"/report.csv", path, "https://api.weibo.com/chat/", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "name,value\nfoo,42\n" {
+		t.Fatalf("unexpected document content: %q", data)
+	}
+}
+
+func TestRealtimeMediaDownloaderRejectsTextForPageMedia(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html;charset=utf-8")
+		_, _ = w.Write([]byte("<html>not an image</html>"))
+	}))
+	defer server.Close()
+
+	downloader := NewRealtimeMediaDownloader(&config.GroupChatModeConfig{
+		Chat:   config.ChatConfig{DirectDownloadTimeoutSeconds: 2},
+		Output: config.GroupChatOutputConfig{MediaDir: t.TempDir()},
+	}, nil)
+	downloader.client = server.Client()
+	_, err := downloader.downloadURLToPath(server.URL+"/bad.jpg", filepath.Join(t.TempDir(), "bad.jpg"), "https://weibo.com/", false)
+	if err == nil || !strings.Contains(err.Error(), "媒体响应类型异常") {
+		t.Fatalf("unexpected page media error: %v", err)
 	}
 }
 

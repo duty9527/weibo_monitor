@@ -249,6 +249,92 @@ func AppendRecords(path string, records []OutputRecord) error {
 	return nil
 }
 
+// MergeRecords inserts records into their daily files, removes duplicate IDs,
+// and rewrites each affected day in chronological order. It is used by
+// reconnect backfill, where older messages may arrive after newer live events.
+func MergeRecords(path string, records []OutputRecord) error {
+	if len(records) == 0 {
+		return nil
+	}
+	outputDir := historyOutputDir(path)
+	if err := os.MkdirAll(outputDir, 0o755); err != nil {
+		return fmt.Errorf("创建历史输出目录失败: %w", err)
+	}
+	grouped := make(map[string][]OutputRecord)
+	for _, record := range records {
+		dateStr := normalizeRecordDate(record)
+		grouped[dateStr] = append(grouped[dateStr], record)
+	}
+	for dateStr, incoming := range grouped {
+		filePath := filepath.Join(outputDir, dateStr+".jsonl")
+		byID := make(map[string]OutputRecord)
+		if file, err := os.Open(filePath); err == nil {
+			scanner := bufio.NewScanner(file)
+			scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+			for scanner.Scan() {
+				var record OutputRecord
+				if err := json.Unmarshal(scanner.Bytes(), &record); err != nil {
+					file.Close()
+					return fmt.Errorf("解析每日历史文件 %s 失败: %w", filePath, err)
+				}
+				if strings.TrimSpace(record.ID) == "" {
+					file.Close()
+					return fmt.Errorf("每日历史文件 %s 存在缺少 id 的记录", filePath)
+				}
+				byID[record.ID] = record
+			}
+			scanErr := scanner.Err()
+			closeErr := file.Close()
+			if scanErr != nil {
+				return scanErr
+			}
+			if closeErr != nil {
+				return closeErr
+			}
+		} else if !os.IsNotExist(err) {
+			return fmt.Errorf("读取每日历史文件失败: %w", err)
+		}
+		for _, record := range incoming {
+			if strings.TrimSpace(record.ID) != "" {
+				byID[record.ID] = record
+			}
+		}
+		merged := make([]OutputRecord, 0, len(byID))
+		for _, record := range byID {
+			merged = append(merged, record)
+		}
+		sortOutputRecords(merged)
+		tmp, err := os.CreateTemp(outputDir, ".history-merge-*")
+		if err != nil {
+			return err
+		}
+		tmpPath := tmp.Name()
+		defer os.Remove(tmpPath)
+		for _, record := range merged {
+			line, err := json.Marshal(record)
+			if err != nil {
+				tmp.Close()
+				return err
+			}
+			if _, err := fmt.Fprintf(tmp, "%s\n", line); err != nil {
+				tmp.Close()
+				return err
+			}
+		}
+		if err := tmp.Chmod(0o644); err != nil {
+			tmp.Close()
+			return err
+		}
+		if err := tmp.Close(); err != nil {
+			return err
+		}
+		if err := os.Rename(tmpPath, filePath); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func loadSeenIDsFromFile(path string, seen map[string]struct{}) error {
 	file, err := os.Open(path)
 	if os.IsNotExist(err) {
@@ -319,6 +405,7 @@ func buildOutputRecord(msg ChatMessage, readableTime, sender, text string, media
 		Date:            dateStr,
 		Hour:            hour,
 		Sender:          sender,
+		SenderUID:       msg.FromUID.String(),
 		Message:         text,
 		MsgType:         classifyMessage(text, hasImage),
 		TextClean:       cleanText(text),
@@ -483,6 +570,22 @@ func matchesTargetSender(sender string, filters []string) bool {
 			continue
 		}
 		if sender == filter || strings.Contains(sender, filter) {
+			return true
+		}
+	}
+	return false
+}
+
+func MatchesTargetSender(sender, senderUID string, senderFilters, uidFilters []string) bool {
+	if matchesTargetSender(sender, senderFilters) {
+		return true
+	}
+	senderUID = strings.TrimSpace(senderUID)
+	if senderUID == "" {
+		return false
+	}
+	for _, filter := range uidFilters {
+		if senderUID == strings.TrimSpace(filter) {
 			return true
 		}
 	}

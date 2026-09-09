@@ -3,6 +3,7 @@ package groupchat
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -20,6 +21,14 @@ func TestSubscriptionProcessorDeduplicatesAndMarksRecall(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	hookCalls := 0
+	processor.SetMessageHook(func(record OutputRecord) error {
+		hookCalls++
+		if record.SenderUID != "6355013357" {
+			t.Fatalf("sender uid = %q", record.SenderUID)
+		}
+		return nil
+	})
 
 	first, err := processor.Process(json.RawMessage(testMessage321))
 	if err != nil {
@@ -28,12 +37,18 @@ func TestSubscriptionProcessorDeduplicatesAndMarksRecall(t *testing.T) {
 	if first.Kind != "message" || first.MessageID != "5338146583347736" || first.Duplicate {
 		t.Fatalf("unexpected first result: %#v", first)
 	}
+	if first.Record == nil || first.Record.SenderUID != "6355013357" || hookCalls != 1 {
+		t.Fatalf("unexpected notification record: result=%#v hook_calls=%d", first, hookCalls)
+	}
 	duplicate, err := processor.Process(json.RawMessage(testMessage321))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !duplicate.Duplicate {
 		t.Fatalf("second message should be duplicate: %#v", duplicate)
+	}
+	if hookCalls != 1 {
+		t.Fatalf("duplicate message invoked hook; calls=%d", hookCalls)
 	}
 
 	recall, err := processor.Process(json.RawMessage(testRecall331))
@@ -65,6 +80,32 @@ func TestSubscriptionProcessorDeduplicatesAndMarksRecall(t *testing.T) {
 	}
 	if !recallAfterRestart.Duplicate {
 		t.Fatalf("recall should remain duplicate after restart: %#v", recallAfterRestart)
+	}
+}
+
+func TestSubscriptionProcessorRetriesWhenMessageHookFails(t *testing.T) {
+	cfg := subscriptionTestConfig(t.TempDir())
+	processor, err := NewSubscriptionEventProcessor(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantErr := errors.New("outbox unavailable")
+	processor.SetMessageHook(func(OutputRecord) error { return wantErr })
+	if _, err := processor.Process(json.RawMessage(testMessage321)); !errors.Is(err, wantErr) {
+		t.Fatalf("first process error = %v, want %v", err, wantErr)
+	}
+
+	hookCalls := 0
+	processor.SetMessageHook(func(OutputRecord) error {
+		hookCalls++
+		return nil
+	})
+	result, err := processor.Process(json.RawMessage(testMessage321))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Duplicate || hookCalls != 1 {
+		t.Fatalf("message was not retried: result=%#v hook_calls=%d", result, hookCalls)
 	}
 }
 

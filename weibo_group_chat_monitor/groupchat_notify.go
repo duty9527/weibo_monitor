@@ -7,7 +7,11 @@ import (
 	"weibo_group_chat_monitor/telegram"
 )
 
-func sendGroupChatSummaries(ctx context.Context, notifier *telegram.Client, summaries []groupchat.SenderSummary) error {
+type groupChatSummarySender interface {
+	SendGroupChatSummary(context.Context, string, []telegram.GroupChatSummaryEntry) error
+}
+
+func sendGroupChatSummaries(ctx context.Context, notifier groupChatSummarySender, summaries []groupchat.SenderSummary) error {
 	for _, summary := range summaries {
 		entries := make([]telegram.GroupChatSummaryEntry, 0, len(summary.Entries))
 		for _, entry := range summary.Entries {

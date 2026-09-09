@@ -30,32 +30,48 @@ type GroupChatModeConfig struct {
 }
 
 type SubscriptionConfig struct {
-	CookieCacheFile       string `yaml:"cookie_cache_file"`
-	EventLogFile          string `yaml:"event_log_file"`
-	ProcessedStateFile    string `yaml:"processed_state_file"`
-	LoginTimeoutSeconds   int    `yaml:"login_timeout_seconds"`
-	RetryDelaySeconds     int    `yaml:"retry_delay_seconds"`
-	TLSInsecureSkipVerify bool   `yaml:"tls_insecure_skip_verify"`
+	CookieCacheFile                   string `yaml:"cookie_cache_file"`
+	EventLogFile                      string `yaml:"event_log_file"`
+	EventLogRetentionDays             int    `yaml:"event_log_retention_days"`
+	NotificationQueueFile             string `yaml:"notification_queue_file"`
+	ProcessedStateFile                string `yaml:"processed_state_file"`
+	AuthRefreshStateFile              string `yaml:"auth_refresh_state_file"`
+	RuntimeAlertStateFile             string `yaml:"runtime_alert_state_file"`
+	LoginTimeoutSeconds               int    `yaml:"login_timeout_seconds"`
+	RetryDelaySeconds                 int    `yaml:"retry_delay_seconds"`
+	ConnectTimeoutSeconds             int    `yaml:"connect_timeout_seconds"`
+	AuthCheckIntervalHours            int    `yaml:"auth_check_interval_hours"`
+	ProactiveRefreshBeforeExpiryHours int    `yaml:"proactive_refresh_before_expiry_hours"`
+	BackfillEnabled                   *bool  `yaml:"backfill_enabled"`
+	BackfillMaxPages                  int    `yaml:"backfill_max_pages"`
+	BackfillOnFirstStart              bool   `yaml:"backfill_on_first_start"`
+	TLSInsecureSkipVerify             bool   `yaml:"tls_insecure_skip_verify"`
+}
+
+func (c SubscriptionConfig) IsBackfillEnabled() bool {
+	return c.BackfillEnabled == nil || *c.BackfillEnabled
 }
 
 type WeiboConfig struct {
-	TargetUID              string `yaml:"target_uid"`
-	SinceTime              string `yaml:"since_time"`
-	StateFile              string `yaml:"state_file"`
-	HistoryFile            string `yaml:"history_file"`
-	MediaDir               string `yaml:"media_dir"`
-	UserDataDir            string `yaml:"user_data_dir"`
-	CookieFile             string `yaml:"cookie_file"`
-	CookieString           string `yaml:"cookie_string"`
-	BrowserApp             string `yaml:"browser_app"`
-	BrowserChannel         string `yaml:"browser_channel"`
-	LoginURL               string `yaml:"login_url"`
-	LoginTimeoutSeconds    int    `yaml:"login_timeout_seconds"`
-	LoginCheckInterval     int    `yaml:"login_check_interval_seconds"`
-	PlaywrightRefreshHours int    `yaml:"playwright_refresh_hours"`
-	MaxPages               int    `yaml:"max_pages"`
-	PageIntervalSeconds    int    `yaml:"page_interval_seconds"`
-	PollIntervalSeconds    int    `yaml:"poll_interval_seconds"`
+	TargetUID           string `yaml:"target_uid"`
+	SinceTime           string `yaml:"since_time"`
+	StateFile           string `yaml:"state_file"`
+	HistoryFile         string `yaml:"history_file"`
+	MediaDir            string `yaml:"media_dir"`
+	UserDataDir         string `yaml:"user_data_dir"`
+	CookieFile          string `yaml:"cookie_file"`
+	CookieString        string `yaml:"cookie_string"`
+	BrowserApp          string `yaml:"browser_app"`
+	BrowserChannel      string `yaml:"browser_channel"`
+	LoginURL            string `yaml:"login_url"`
+	LoginTimeoutSeconds int    `yaml:"login_timeout_seconds"`
+	LoginCheckInterval  int    `yaml:"login_check_interval_seconds"`
+	// PlaywrightRefreshHours is retained only so older configuration files still parse.
+	// Scheduled browser refresh is disabled; Playwright now runs only after validation fails.
+	PlaywrightRefreshHours int `yaml:"playwright_refresh_hours"`
+	MaxPages               int `yaml:"max_pages"`
+	PageIntervalSeconds    int `yaml:"page_interval_seconds"`
+	PollIntervalSeconds    int `yaml:"poll_interval_seconds"`
 }
 
 type BrowserConfig struct {
@@ -92,7 +108,8 @@ type GroupChatStateConfig struct {
 }
 
 type GroupChatFilterConfig struct {
-	TargetSenders []string `yaml:"target_senders"`
+	TargetSenders    []string `yaml:"target_senders"`
+	TargetSenderUIDs []string `yaml:"target_sender_uids"`
 }
 
 type LocalHistoryPushConfig struct {
@@ -207,9 +224,6 @@ func (c *WeiboModeConfig) validate() error {
 	if c.Weibo.LoginCheckInterval <= 0 {
 		c.Weibo.LoginCheckInterval = 5
 	}
-	if c.Weibo.PlaywrightRefreshHours <= 0 {
-		c.Weibo.PlaywrightRefreshHours = 6
-	}
 	if c.Weibo.MaxPages < 0 {
 		return fmt.Errorf("weibo.max_pages 不能小于 0")
 	}
@@ -280,16 +294,40 @@ func (c *GroupChatModeConfig) validate() error {
 		c.Subscription.CookieCacheFile = "groupchat_cookies.json"
 	}
 	if strings.TrimSpace(c.Subscription.EventLogFile) == "" {
-		c.Subscription.EventLogFile = "groupchat_events.jsonl"
+		c.Subscription.EventLogFile = "groupchat_events"
+	}
+	if c.Subscription.EventLogRetentionDays <= 0 {
+		c.Subscription.EventLogRetentionDays = 7
 	}
 	if strings.TrimSpace(c.Subscription.ProcessedStateFile) == "" {
 		c.Subscription.ProcessedStateFile = "groupchat_subscription_state.json"
+	}
+	if strings.TrimSpace(c.Subscription.NotificationQueueFile) == "" {
+		c.Subscription.NotificationQueueFile = "groupchat_notification_outbox.json"
+	}
+	if strings.TrimSpace(c.Subscription.AuthRefreshStateFile) == "" {
+		c.Subscription.AuthRefreshStateFile = "groupchat_auth_refresh_state.json"
+	}
+	if strings.TrimSpace(c.Subscription.RuntimeAlertStateFile) == "" {
+		c.Subscription.RuntimeAlertStateFile = "groupchat_runtime_alert_state.json"
 	}
 	if c.Subscription.LoginTimeoutSeconds <= 0 {
 		c.Subscription.LoginTimeoutSeconds = 180
 	}
 	if c.Subscription.RetryDelaySeconds <= 0 {
 		c.Subscription.RetryDelaySeconds = 5
+	}
+	if c.Subscription.ConnectTimeoutSeconds <= 0 {
+		c.Subscription.ConnectTimeoutSeconds = 90
+	}
+	if c.Subscription.AuthCheckIntervalHours <= 0 {
+		c.Subscription.AuthCheckIntervalHours = 6
+	}
+	if c.Subscription.ProactiveRefreshBeforeExpiryHours <= 0 {
+		c.Subscription.ProactiveRefreshBeforeExpiryHours = 96
+	}
+	if c.Subscription.BackfillMaxPages <= 0 {
+		c.Subscription.BackfillMaxPages = 20
 	}
 
 	if strings.TrimSpace(c.Output.HistoryFile) == "" {
@@ -303,6 +341,7 @@ func (c *GroupChatModeConfig) validate() error {
 	}
 
 	c.Filters.TargetSenders = trimNonEmptyStrings(c.Filters.TargetSenders)
+	c.Filters.TargetSenderUIDs = trimNonEmptyStrings(c.Filters.TargetSenderUIDs)
 	c.LocalHistory.StartDate = strings.TrimSpace(c.LocalHistory.StartDate)
 	c.LocalHistory.EndDate = strings.TrimSpace(c.LocalHistory.EndDate)
 	if c.LocalHistory.MaxRecords < 0 {
@@ -323,8 +362,8 @@ func (c *GroupChatModeConfig) validate() error {
 	if err := validateCommon(&c.Telegram, &c.Log); err != nil {
 		return err
 	}
-	if c.Telegram.Enabled && len(c.Filters.TargetSenders) == 0 {
-		return fmt.Errorf("telegram.enabled=true 时 filters.target_senders 不能为空")
+	if c.Telegram.Enabled && len(c.Filters.TargetSenders) == 0 && len(c.Filters.TargetSenderUIDs) == 0 {
+		return fmt.Errorf("telegram.enabled=true 时 filters.target_senders 和 filters.target_sender_uids 不能同时为空")
 	}
 	return nil
 }
@@ -337,7 +376,10 @@ func (c *GroupChatModeConfig) resolvePaths(baseDir string) {
 	c.State.StateFile = resolvePath(baseDir, c.State.StateFile)
 	c.Subscription.CookieCacheFile = resolvePath(baseDir, c.Subscription.CookieCacheFile)
 	c.Subscription.EventLogFile = resolvePath(baseDir, c.Subscription.EventLogFile)
+	c.Subscription.NotificationQueueFile = resolvePath(baseDir, c.Subscription.NotificationQueueFile)
 	c.Subscription.ProcessedStateFile = resolvePath(baseDir, c.Subscription.ProcessedStateFile)
+	c.Subscription.AuthRefreshStateFile = resolvePath(baseDir, c.Subscription.AuthRefreshStateFile)
+	c.Subscription.RuntimeAlertStateFile = resolvePath(baseDir, c.Subscription.RuntimeAlertStateFile)
 }
 
 func validateCommon(telegram *TelegramConfig, log *LogConfig) error {
@@ -362,7 +404,7 @@ func validateCommon(telegram *TelegramConfig, log *LogConfig) error {
 		}
 	}
 	if log.Level == "" {
-		log.Level = "info"
+		log.Level = "error"
 	}
 	return nil
 }

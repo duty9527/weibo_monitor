@@ -12,7 +12,8 @@ weibo:
   login_url: ""
   login_timeout_seconds: 180
   login_check_interval_seconds: 5
-  playwright_refresh_hours: 6
+  # 已弃用：程序不再定时启动 Playwright，仅在 Cookie 验证失败时启动
+  playwright_refresh_hours: 0
   max_pages: 10
   page_interval_seconds: 2
   poll_interval_seconds: 300
@@ -29,4 +30,4 @@ telegram:
   proxy_url: ""
 
 log:
-  level: "info"
+  level: "error"

@@ -19,9 +19,13 @@ type SenderSummaryEntry struct {
 }
 
 func BuildSenderSummaries(now time.Time, records []OutputRecord, filters []string) []SenderSummary {
+	return BuildSenderSummariesWithUIDs(now, records, filters, nil)
+}
+
+func BuildSenderSummariesWithUIDs(now time.Time, records []OutputRecord, senderFilters, uidFilters []string) []SenderSummary {
 	groupedByDate := make(map[string]map[string][]OutputRecord)
 	for _, record := range records {
-		if !matchesTargetSender(record.Sender, filters) {
+		if !MatchesTargetSender(record.Sender, record.SenderUID, senderFilters, uidFilters) {
 			continue
 		}
 
@@ -61,19 +65,24 @@ func BuildSenderSummaries(now time.Time, records []OutputRecord, filters []strin
 }
 
 func BuildLocalHistorySenderSummaries(records []OutputRecord, filters []string) []SenderSummary {
-	return buildSenderSummaries(records, filters, func(sender string, senderRecords []OutputRecord) string {
+	return BuildLocalHistorySenderSummariesWithUIDs(records, filters, nil)
+}
+
+func BuildLocalHistorySenderSummariesWithUIDs(records []OutputRecord, senderFilters, uidFilters []string) []SenderSummary {
+	return buildSenderSummaries(records, senderFilters, uidFilters, func(sender string, senderRecords []OutputRecord) string {
 		return FormatLocalHistorySummaryHeader(sender, senderRecords)
 	})
 }
 
 func buildSenderSummaries(
 	records []OutputRecord,
-	filters []string,
+	senderFilters []string,
+	uidFilters []string,
 	headerFn func(sender string, senderRecords []OutputRecord) string,
 ) []SenderSummary {
 	grouped := make(map[string][]OutputRecord)
 	for _, record := range records {
-		if !matchesTargetSender(record.Sender, filters) {
+		if !MatchesTargetSender(record.Sender, record.SenderUID, senderFilters, uidFilters) {
 			continue
 		}
 		if record.MsgType == "system" {

@@ -10,7 +10,53 @@ import (
 	"reflect"
 	"sync"
 	"testing"
+	"time"
 )
+
+func TestBayeuxConnectAppliesClientDeadline(t *testing.T) {
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/im/handshake":
+			_, _ = w.Write([]byte(`[{"channel":"/meta/handshake","successful":true,"clientId":"client-timeout"}]`))
+		case "/im/connect":
+			<-release
+		}
+	}))
+	defer func() {
+		close(release)
+		server.Close()
+	}()
+	client, err := NewBayeuxClient(server.URL+"/im", "", server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.SetConnectTimeout(30 * time.Millisecond)
+	if _, err := client.Handshake(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	_, err = client.Connect(context.Background())
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("connect error = %v, want deadline exceeded", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("connect deadline took too long: %s", elapsed)
+	}
+}
+
+func TestBayeuxConnectUsesServerAdviceTimeoutWithGrace(t *testing.T) {
+	client, err := NewBayeuxClient("https://example.com/im", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.SetConnectTimeout(90 * time.Second)
+	client.updateServerTimeout(&BayeuxAdvice{Timeout: 45000})
+	if got, want := client.currentConnectTimeout(), 60*time.Second; got != want {
+		t.Fatalf("connect timeout = %s, want %s", got, want)
+	}
+}
 
 func TestBayeuxReconnectAdviceSemantics(t *testing.T) {
 	client, err := NewBayeuxClient("https://example.com/im", "", nil)
@@ -103,7 +149,7 @@ func TestBayeuxConnectCarriesAckSequence(t *testing.T) {
 	}
 }
 
-func TestBayeuxReceiveRepeatsHandshakeWhenAdvised(t *testing.T) {
+func TestBayeuxReceiveReturnsHandshakeAdviceToCoordinator(t *testing.T) {
 	var mu sync.Mutex
 	handshakes := 0
 	subscriptions := 0
@@ -134,14 +180,13 @@ func TestBayeuxReceiveRepeatsHandshakeWhenAdvised(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	err = client.Listen(ctx, "/im/42", func(BayeuxMessage) { cancel() })
-	if err != nil {
-		t.Fatal(err)
+	err = client.Listen(context.Background(), "/im/42", nil)
+	if !errors.Is(err, ErrBayeuxHandshakeRequired) {
+		t.Fatalf("expected handshake-required error, got %v", err)
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if handshakes != 2 || subscriptions != 2 || connects != 2 {
+	if handshakes != 1 || subscriptions != 1 || connects != 1 {
 		t.Fatalf("handshakes=%d subscriptions=%d connects=%d", handshakes, subscriptions, connects)
 	}
 }

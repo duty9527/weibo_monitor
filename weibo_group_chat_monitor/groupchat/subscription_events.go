@@ -26,6 +26,7 @@ type SubscriptionProcessResult struct {
 	Ignored      bool
 	MediaPaths   []string
 	MediaErrors  []string
+	Record       *OutputRecord
 }
 
 type subscriptionEnvelope struct {
@@ -54,6 +55,8 @@ type SubscriptionEventProcessor struct {
 	seenKeys  map[string]struct{}
 	seenIDs   map[string]struct{}
 	media     *RealtimeMediaDownloader
+	onMessage func(OutputRecord) error
+	runState  *RunState
 	mu        sync.Mutex
 }
 
@@ -61,6 +64,12 @@ func (p *SubscriptionEventProcessor) SetMediaCookies(cookies []StoredCookie) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.media = NewRealtimeMediaDownloader(p.cfg, cookies)
+}
+
+func (p *SubscriptionEventProcessor) SetMessageHook(hook func(OutputRecord) error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.onMessage = hook
 }
 
 func NewSubscriptionEventProcessor(cfg *config.GroupChatModeConfig) (*SubscriptionEventProcessor, error) {
@@ -75,17 +84,55 @@ func NewSubscriptionEventProcessor(cfg *config.GroupChatModeConfig) (*Subscripti
 	if err != nil {
 		return nil, err
 	}
+	runState, err := LoadRunState(cfg.State.StateFile)
+	if err != nil {
+		return nil, err
+	}
 	processor := &SubscriptionEventProcessor{
 		cfg:       cfg,
 		statePath: cfg.Subscription.ProcessedStateFile,
 		keys:      append([]string(nil), state.Keys...),
 		seenKeys:  make(map[string]struct{}, len(state.Keys)),
 		seenIDs:   seenIDs,
+		runState:  runState,
 	}
 	for _, key := range state.Keys {
 		processor.seenKeys[key] = struct{}{}
 	}
 	return processor, nil
+}
+
+func (p *SubscriptionEventProcessor) Checkpoint() MessageBoundary {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.runState == nil {
+		return MessageBoundary{}
+	}
+	boundary := MessageBoundary{ID: strings.TrimSpace(p.runState.LastMessageID)}
+	if parsed, ok := p.runState.LastMessageParsedTime(); ok {
+		boundary.Time = parsed
+	}
+	return boundary
+}
+
+func (p *SubscriptionEventProcessor) EstablishCheckpoint(msg ChatMessage) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.runState == nil {
+		p.runState = &RunState{}
+	}
+	if strings.TrimSpace(p.runState.LastMessageID) != "" {
+		return nil
+	}
+	p.runState.SetBoundary(msg.IDString(), msg.TimeValue(time.Now()))
+	p.runState.SetLastRunAt(time.Now())
+	return SaveRunState(p.cfg.State.StateFile, p.runState)
+}
+
+func (p *SubscriptionEventProcessor) ProcessHistoryMessage(message ChatMessage) (SubscriptionProcessResult, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.processChatMessage(strings.TrimSpace(p.cfg.Chat.GroupID), message, true)
 }
 
 func (p *SubscriptionEventProcessor) Process(data json.RawMessage) (SubscriptionProcessResult, error) {
@@ -118,7 +165,12 @@ func (p *SubscriptionEventProcessor) processMessage(envelope subscriptionEnvelop
 	if err := json.Unmarshal(envelope.Info, &message); err != nil {
 		return result, fmt.Errorf("解析 321 消息内容失败: %w", err)
 	}
-	if header.GID.String() != strings.TrimSpace(p.cfg.Chat.GroupID) {
+	return p.processChatMessage(header.GID.String(), message, false)
+}
+
+func (p *SubscriptionEventProcessor) processChatMessage(gid string, message ChatMessage, mergeHistory bool) (SubscriptionProcessResult, error) {
+	result := SubscriptionProcessResult{Kind: "message"}
+	if gid != strings.TrimSpace(p.cfg.Chat.GroupID) {
 		result.Ignored = true
 		return result, nil
 	}
@@ -127,13 +179,16 @@ func (p *SubscriptionEventProcessor) processMessage(envelope subscriptionEnvelop
 	if messageID == "" {
 		return result, fmt.Errorf("321 消息缺少 id")
 	}
-	key := "message:" + header.GID.String() + ":" + messageID
+	key := "message:" + gid + ":" + messageID
 	if p.hasProcessed(key) {
 		result.Duplicate = true
-		return result, nil
+		return result, p.advanceCheckpoint(message, time.Now())
 	}
 	if _, exists := p.seenIDs[messageID]; exists {
 		result.Duplicate = true
+		if err := p.advanceCheckpoint(message, time.Now()); err != nil {
+			return result, err
+		}
 		return result, p.remember(key)
 	}
 
@@ -150,17 +205,47 @@ func (p *SubscriptionEventProcessor) processMessage(envelope subscriptionEnvelop
 				result.MediaErrors = append(result.MediaErrors, err.Error())
 			}
 		}
+		if HasMediaAuthenticationFailure(failures) {
+			return result, ErrMediaAuthentication
+		}
 	}
 	now := time.Now()
 	record := buildOutputRecord(message, message.ReadableTime(now), message.SenderName(), message.TextContent(), mediaPaths)
-	if err := AppendRecords(p.cfg.Output.HistoryFile, []OutputRecord{record}); err != nil {
+	result.Record = &record
+	if p.onMessage != nil {
+		if err := p.onMessage(record); err != nil {
+			return result, fmt.Errorf("持久化消息通知失败: %w", err)
+		}
+	}
+	var err error
+	if mergeHistory {
+		err = MergeRecords(p.cfg.Output.HistoryFile, []OutputRecord{record})
+	} else {
+		err = AppendRecords(p.cfg.Output.HistoryFile, []OutputRecord{record})
+	}
+	if err != nil {
 		return result, err
 	}
 	p.seenIDs[messageID] = struct{}{}
+	if err := p.advanceCheckpoint(message, now); err != nil {
+		return result, err
+	}
 	if err := p.remember(key); err != nil {
 		return result, err
 	}
 	return result, nil
+}
+
+func (p *SubscriptionEventProcessor) advanceCheckpoint(message ChatMessage, now time.Time) error {
+	if p.runState == nil {
+		p.runState = &RunState{}
+	}
+	if !isAfterStateBoundary(p.runState, message) {
+		return nil
+	}
+	p.runState.SetBoundary(message.IDString(), message.TimeValue(now))
+	p.runState.SetLastRunAt(now)
+	return SaveRunState(p.cfg.State.StateFile, p.runState)
 }
 
 func (p *SubscriptionEventProcessor) processRecall(envelope subscriptionEnvelope) (SubscriptionProcessResult, error) {

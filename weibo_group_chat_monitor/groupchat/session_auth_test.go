@@ -8,6 +8,42 @@ import (
 	"time"
 )
 
+func TestALFProactiveRefreshDue(t *testing.T) {
+	now := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	cookies := []StoredCookie{{Name: "ALF", Domain: ".weibo.com", Expires: float64(now.Add(72 * time.Hour).Unix())}}
+	fingerprint, expiresAt, due := ALFProactiveRefreshDue(cookies, now, 96*time.Hour)
+	if !due || fingerprint == "" || !expiresAt.Equal(now.Add(72*time.Hour)) {
+		t.Fatalf("fingerprint=%q expires=%v due=%v", fingerprint, expiresAt, due)
+	}
+	if _, _, due := ALFProactiveRefreshDue(cookies, now, 48*time.Hour); due {
+		t.Fatal("ALF should not be due outside refresh window")
+	}
+}
+
+func TestClaimALFProactiveRefreshOnlyOncePerExpiry(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "auth-refresh.json")
+	now := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	claimed, err := ClaimALFProactiveRefresh(path, "ALF|weibo|1", now)
+	if err != nil || !claimed {
+		t.Fatalf("first claim=%v err=%v", claimed, err)
+	}
+	claimed, err = ClaimALFProactiveRefresh(path, "ALF|weibo|1", now.Add(time.Hour))
+	if err != nil || claimed {
+		t.Fatalf("duplicate claim=%v err=%v", claimed, err)
+	}
+	claimed, err = ClaimALFProactiveRefresh(path, "ALF|weibo|2", now.Add(2*time.Hour))
+	if err != nil || !claimed {
+		t.Fatalf("new expiry claim=%v err=%v", claimed, err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("state mode=%o", info.Mode().Perm())
+	}
+}
+
 func TestCookieHeaderForHostPreservesDomainScopeAndSkipsExpired(t *testing.T) {
 	cookies := []StoredCookie{
 		{Name: "SUB", Value: "valid", Domain: ".weibo.com", Expires: float64(time.Now().Add(time.Hour).Unix())},

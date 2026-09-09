@@ -10,5 +10,6 @@ media_downloads
 *.jsonl
 *.json
 weibo_monitor_go/weibo_monitor
+weibo_group_chat_monitor/weibo_group_chat_monitor
 *.png
 __pycache__

@@ -12,10 +12,11 @@ import (
 )
 
 type LocalHistoryReadOptions struct {
-	TargetSenders []string
-	StartDate     string
-	EndDate       string
-	MaxRecords    int
+	TargetSenders    []string
+	TargetSenderUIDs []string
+	StartDate        string
+	EndDate          string
+	MaxRecords       int
 }
 
 func LoadLocalHistoryRecords(historyPath string, opts LocalHistoryReadOptions) ([]OutputRecord, error) {
@@ -123,7 +124,7 @@ func loadLocalHistoryFile(
 		if err := json.Unmarshal([]byte(line), &record); err != nil {
 			return fmt.Errorf("解析历史记录失败: %s:%d: %w", path, lineNo, err)
 		}
-		if !matchesTargetSender(record.Sender, opts.TargetSenders) {
+		if !MatchesTargetSender(record.Sender, record.SenderUID, opts.TargetSenders, opts.TargetSenderUIDs) {
 			continue
 		}
 		if !recordDateInRange(record, startDate, endDate) {

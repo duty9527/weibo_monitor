@@ -53,16 +53,17 @@ func executeGroupChatHistoryPush(ctx context.Context, cfg *config.GroupChatModeC
 	logger := newLogger(cfg.Log.Level)
 
 	records, err := groupchat.LoadLocalHistoryRecords(cfg.Output.HistoryFile, groupchat.LocalHistoryReadOptions{
-		TargetSenders: cfg.Filters.TargetSenders,
-		StartDate:     cfg.LocalHistory.StartDate,
-		EndDate:       cfg.LocalHistory.EndDate,
-		MaxRecords:    cfg.LocalHistory.MaxRecords,
+		TargetSenders:    cfg.Filters.TargetSenders,
+		TargetSenderUIDs: cfg.Filters.TargetSenderUIDs,
+		StartDate:        cfg.LocalHistory.StartDate,
+		EndDate:          cfg.LocalHistory.EndDate,
+		MaxRecords:       cfg.LocalHistory.MaxRecords,
 	})
 	if err != nil {
 		return fmt.Errorf("读取本地历史失败: %w", err)
 	}
 
-	summaries := groupchat.BuildLocalHistorySenderSummaries(records, cfg.Filters.TargetSenders)
+	summaries := groupchat.BuildLocalHistorySenderSummariesWithUIDs(records, cfg.Filters.TargetSenders, cfg.Filters.TargetSenderUIDs)
 	if len(summaries) == 0 {
 		logger.Info(
 			"未命中本地历史筛选结果",

@@ -25,11 +25,29 @@ subscription:
   # Playwright 登录成功后写入，文件权限自动设为 0600
   cookie_cache_file: "groupchat_cookies.json"
   # 保留原始订阅事件，便于审计和排查未知事件类型
-  event_log_file: "groupchat_events.jsonl"
+  event_log_file: "groupchat_events"
+  event_log_retention_days: 7
+  # Telegram 实时推送的持久化队列；失败或重启后继续发送
+  notification_queue_file: "groupchat_notification_outbox.json"
   # 已处理消息/撤回事件的持久化去重状态。
   processed_state_file: "groupchat_subscription_state.json"
+  # 记录已尝试过的临期 Cookie，避免每次启动都重复拉起 Playwright
+  auth_refresh_state_file: "groupchat_auth_refresh_state.json"
+  # Cookie 所有恢复方式均失败时的 Telegram 去重告警状态
+  runtime_alert_state_file: "groupchat_runtime_alert_state.json"
   login_timeout_seconds: 180
   retry_delay_seconds: 5
+  # /meta/connect 没有给出 advice.timeout 时使用的客户端兜底超时
+  connect_timeout_seconds: 90
+  # 每 6 小时仅用纯 Go 验证一次登录态，不启动浏览器
+  auth_check_interval_hours: 6
+  # ALF 距离过期 4 天时尝试一次无头 Playwright 预刷新
+  proactive_refresh_before_expiry_hours: 96
+  # 启动和断线重连后使用群历史接口补齐遗漏消息
+  backfill_enabled: true
+  backfill_max_pages: 20
+  # 首次没有本地边界时只记录最新位置，不倒灌整个群历史
+  backfill_on_first_start: false
   # web.im.weibo.com 的证书链在部分 Linux 环境无法验证；仅测试时开启
   tls_insecure_skip_verify: false
 
@@ -44,6 +62,8 @@ state:
 filters:
   target_senders:
     - "germer_123"
+  # 昵称或 UID 任意一个匹配即可；UID 不受改名影响
+  target_sender_uids: []
 
 local_history_push:
   start_date: ""
@@ -68,4 +88,4 @@ telegram:
   proxy_url: ""
 
 log:
-  level: "info"
+  level: "error"

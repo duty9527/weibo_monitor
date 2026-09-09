@@ -26,6 +26,8 @@ func run(args []string) int {
 		return runGroupChatSubscribeMode(remaining)
 	case "groupchat-history":
 		return runGroupChatHistoryMode(remaining)
+	case "groupchat-media-retry":
+		return runGroupChatMediaRetryMode(remaining)
 	default:
 		fmt.Fprintf(os.Stderr, "不支持的运行模式: %s\n\n%s", mode, usageText())
 		return 2
@@ -68,6 +70,8 @@ func normalizeMode(value string) string {
 		return "groupchat-subscribe"
 	case "groupchat_history", "groupchat-history", "historypush", "groupchathistory":
 		return "groupchat-history"
+	case "groupchat_media_retry", "groupchat-media-retry", "media-retry":
+		return "groupchat-media-retry"
 	default:
 		return value
 	}
@@ -79,6 +83,7 @@ func usageText() string {
   go run . groupchat -config config.groupchat.yaml
   go run . groupchat-subscribe -config config.groupchat.yaml
   go run . groupchat-history -config config.groupchat.yaml
+  go run . groupchat-media-retry -config config.groupchat.yaml
   go run . -mode=weibo
   go run . -mode=groupchat
   go run . -mode=groupchat-subscribe

@@ -67,9 +67,10 @@ func executeGroupChatOnce(ctx context.Context, cfg *config.GroupChatModeConfig, 
 		}
 
 		records, err := groupchat.LoadLocalHistoryRecords(cfg.Output.HistoryFile, groupchat.LocalHistoryReadOptions{
-			TargetSenders: cfg.Filters.TargetSenders,
-			StartDate:     startDate,
-			EndDate:       time.Now().Format("2006-01-02"),
+			TargetSenders:    cfg.Filters.TargetSenders,
+			TargetSenderUIDs: cfg.Filters.TargetSenderUIDs,
+			StartDate:        startDate,
+			EndDate:          time.Now().Format("2006-01-02"),
 		})
 		if err != nil {
 			return fmt.Errorf("加载本地群聊历史失败: %w", err)
@@ -83,7 +84,7 @@ func executeGroupChatOnce(ctx context.Context, cfg *config.GroupChatModeConfig, 
 		}
 
 		if len(toPush) > 0 {
-			summaries := groupchat.BuildSenderSummaries(time.Now(), toPush, cfg.Filters.TargetSenders)
+			summaries := groupchat.BuildSenderSummariesWithUIDs(time.Now(), toPush, cfg.Filters.TargetSenders, cfg.Filters.TargetSenderUIDs)
 			if err := sendGroupChatSummaries(ctx, notifier, summaries); err != nil {
 				return fmt.Errorf("推送群聊摘要失败: %w", err)
 			}
