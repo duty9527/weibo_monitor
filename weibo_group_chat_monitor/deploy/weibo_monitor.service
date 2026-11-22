@@ -7,14 +7,14 @@ Wants=network-online.target
 Type=simple
 User=duty
 WorkingDirectory=/home/duty/weibo_cron
-ExecStart=/home/duty/weibo_cron/weibo_monitor groupchat-subscribe -config /home/duty/weibo_cron/config.groupchat.yaml
+ExecStart=/bin/sh -c 'exec /home/duty/weibo_cron/weibo_monitor groupchat-subscribe -config /home/duty/weibo_cron/config.groupchat.yaml >> /home/duty/weibo_cron/logs/weibo_monitor.error.log 2>&1'
 Restart=on-failure
-RestartSec=5
+RestartSec=60
 TimeoutStopSec=20
 KillSignal=SIGTERM
 UMask=0077
-StandardOutput=append:/home/duty/weibo_cron/logs/weibo_monitor.error.log
-StandardError=append:/home/duty/weibo_cron/logs/weibo_monitor.error.log
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target

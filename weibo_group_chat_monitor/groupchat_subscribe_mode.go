@@ -6,6 +6,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/cookiejar"
 	"os"
@@ -35,7 +36,7 @@ type subscriptionEventLogger struct {
 }
 
 var (
-	errProactiveCookieRefresh = errors.New("ALF 临期预刷新")
+	errProactiveCookieRefresh = errors.New("定期 SSO 刷新")
 	errConfirmedAuthInvalid   = errors.New("微博登录态验证失败")
 )
 
@@ -53,6 +54,7 @@ func runGroupChatSubscribeMode(args []string) int {
 		return 1
 	}
 	logger := newLogger(cfg.Log.Level)
+	logger.Info("群聊监听更新已加载", "release", "2026-10-10-message-layout-v1", "system_notice_filter", true, "cookie_auth_recovery", true)
 	if cfg.Subscription.TLSInsecureSkipVerify {
 		logger.Warn("订阅 TLS 证书校验已关闭；此设置仅应用于 web.im.weibo.com 测试连接")
 	}
@@ -71,6 +73,10 @@ func runGroupChatSubscribeMode(args []string) int {
 			return 1
 		}
 		processor.SetMessageHook(func(record groupchat.OutputRecord) error {
+			if record.MsgType == "system" {
+				logger.Info("已过滤群系统提示，不推送 Telegram", "message_id", record.ID)
+				return nil
+			}
 			if !groupchat.MatchesTargetSender(record.Sender, record.SenderUID, cfg.Filters.TargetSenders, cfg.Filters.TargetSenderUIDs) {
 				return nil
 			}
@@ -90,22 +96,17 @@ func runGroupChatSubscribeMode(args []string) int {
 		logger.Error("清理过期订阅原始事件失败", "err", err)
 	}
 
-	session, err := groupchat.AcquireAuthSession(ctx, cfg, logger, false)
+	session, err := acquireSubscriptionAuthWithRetry(ctx, cfg, logger, notifier, false)
 	if err != nil {
-		logger.Error("获取微博订阅认证失败", "err", err)
-		if ctx.Err() == nil && notifier.Enabled() {
-			_, alertErr := notifyGroupChatAuthFailureOnce(ctx, notifier, cfg.Subscription.RuntimeAlertStateFile, err)
-			if alertErr != nil {
-				logger.Error("发送微博群聊监控运行异常告警失败", "err", alertErr)
-			}
+		if ctx.Err() != nil {
+			return 0
 		}
+		logger.Error("群聊订阅认证重试耗尽，进程以失败状态退出以触发服务重启", "err", err)
 		return 1
-	}
-	if err := clearGroupChatAuthFailureAlert(cfg.Subscription.RuntimeAlertStateFile); err != nil {
-		logger.Error("清除微博群聊监控运行异常状态失败", "err", err)
 	}
 	logger.Info("群聊订阅模式已启动", "uid", session.UID, "event_log_dir", eventLogger.dir)
 
+	exitCode := 0
 	for ctx.Err() == nil {
 		sessionCtx, cancelSession := context.WithCancel(ctx)
 		authEvents := monitorSubscriptionAuth(sessionCtx, cancelSession, cfg, session, logger)
@@ -120,31 +121,24 @@ func runGroupChatSubscribeMode(args []string) int {
 			break
 		}
 		if errors.Is(err, groupchat.ErrBayeuxReconnectNone) {
-			logger.Info("微博服务端要求停止订阅重连")
+			logger.Error("微博服务端要求停止订阅重连，进程以失败状态退出以触发服务重启")
+			exitCode = 1
 			break
 		}
+		_ = writeSubscriptionHealth(cfg.Subscription.ProcessedStateFile+".health.json", "reconnecting")
 		logger.Warn("微博订阅连接中断", "err", err)
 
 		if shouldRefreshSubscriptionCookies(ctx, cfg, session, err, logger) {
 			logger.Warn("订阅认证失效，将临时启动浏览器刷新登录态")
-			refreshedSession, refreshErr := groupchat.AcquireAuthSession(ctx, cfg, logger, true)
+			refreshedSession, refreshErr := acquireSubscriptionAuthWithRetry(ctx, cfg, logger, notifier, true)
 			if refreshErr != nil {
-				logger.Error("刷新微博登录态失败", "err", refreshErr)
-				if ctx.Err() == nil && notifier.Enabled() {
-					_, alertErr := notifyGroupChatAuthFailureOnce(ctx, notifier, cfg.Subscription.RuntimeAlertStateFile, refreshErr)
-					if alertErr != nil {
-						logger.Error("发送微博群聊监控运行异常告警失败", "err", alertErr)
-					}
+				if ctx.Err() == nil {
+					logger.Error("群聊订阅认证恢复重试耗尽，进程以失败状态退出以触发服务重启", "err", refreshErr)
+					exitCode = 1
 				}
-				if err := waitForRetry(ctx, time.Duration(cfg.Subscription.RetryDelaySeconds)*time.Second); err != nil {
-					break
-				}
-				continue
+				break
 			}
 			session = refreshedSession
-			if err := clearGroupChatAuthFailureAlert(cfg.Subscription.RuntimeAlertStateFile); err != nil {
-				logger.Error("清除微博群聊监控运行异常状态失败", "err", err)
-			}
 		}
 
 		if err := waitForRetry(ctx, time.Duration(cfg.Subscription.RetryDelaySeconds)*time.Second); err != nil {
@@ -153,7 +147,7 @@ func runGroupChatSubscribeMode(args []string) int {
 	}
 
 	logger.Info("群聊订阅模式已停止")
-	return 0
+	return exitCode
 }
 
 func runGroupChatNotificationWorker(ctx context.Context, notifier groupChatSummarySender, outbox *groupchat.NotificationOutbox, logger interface {
@@ -179,6 +173,17 @@ func runGroupChatNotificationWorker(ctx context.Context, notifier groupChatSumma
 			}
 		}
 
+		if item.Record.MsgType == "system" {
+			if err := outbox.MarkSent(item.MessageID); err != nil {
+				logger.Error("清理队列中的群系统提示失败", "message_id", item.MessageID, "err", err)
+				if !waitNotificationWorker(ctx, time.Minute, outbox.Wake()) {
+					return
+				}
+				continue
+			}
+			logger.Info("已过滤队列中的群系统提示，不推送 Telegram", "message_id", item.MessageID)
+			continue
+		}
 		summaries := groupchat.BuildSenderSummariesWithUIDs(
 			time.Now(),
 			[]groupchat.OutputRecord{item.Record},
@@ -259,8 +264,9 @@ func runSubscriptionSession(ctx context.Context, cfg *config.GroupChatModeConfig
 	if err := client.Subscribe(ctx, channel); err != nil {
 		return err
 	}
+	_ = writeSubscriptionHealth(cfg.Subscription.ProcessedStateFile+".health.json", "backfilling")
 	if result, err := groupchat.RunSubscriptionBackfill(ctx, cfg, session.Cookies, processor); err != nil {
-		logger.Error("群聊断线补漏失败，将继续实时订阅", "err", err)
+		return fmt.Errorf("群聊断线补漏失败；保留旧边界并重试，避免实时消息覆盖缺口: %w", err)
 	} else if result.Pages > 0 {
 		logger.Info(
 			"群聊断线补漏完成",
@@ -273,7 +279,10 @@ func runSubscriptionSession(ctx context.Context, cfg *config.GroupChatModeConfig
 			"history_exhausted", result.HistoryExhausted,
 		)
 	}
+	_ = writeSubscriptionHealth(cfg.Subscription.ProcessedStateFile+".health.json", "subscribed")
+	logger.Info("群聊实时订阅已连接，历史补漏检查通过")
 	return client.ReceiveWithError(ctx, channel, func(message groupchat.BayeuxMessage) error {
+		_ = writeSubscriptionHealth(cfg.Subscription.ProcessedStateFile+".health.json", "receiving")
 		event := loggedSubscriptionEvent{
 			ReceivedAt: time.Now().Format(time.RFC3339Nano),
 			Channel:    message.Channel,
@@ -389,6 +398,9 @@ func isSubscriptionAuthError(err error) bool {
 	if err == nil {
 		return false
 	}
+	if errors.Is(err, groupchat.ErrMediaAuthentication) {
+		return true
+	}
 	message := strings.ToLower(err.Error())
 	return strings.Contains(message, "auth fail") ||
 		strings.Contains(message, "create_denied") ||
@@ -431,13 +443,21 @@ func monitorSubscriptionAuth(ctx context.Context, cancelSession context.CancelFu
 		return events
 	}
 	go func() {
-		ticker := time.NewTicker(interval)
+		ticker := time.NewTimer(0)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case now := <-ticker.C:
+				ticker.Reset(time.Minute)
+				due, scheduleErr := groupchat.PeriodicAuthRefreshDue(cfg.Subscription.AuthRefreshStateFile, now, interval)
+				if scheduleErr != nil {
+					logger.Info("读取认证刷新调度失败", "err", scheduleErr)
+				}
+				if !due && scheduleErr == nil {
+					continue
+				}
 				checkCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 				_, validationErr := groupchat.ValidateStoredCookies(checkCtx, session.Cookies)
 				cancel()
@@ -454,17 +474,18 @@ func monitorSubscriptionAuth(ctx context.Context, cancelSession context.CancelFu
 					continue
 				}
 				logger.Info("定期 Cookie 登录验证成功")
+				_ = writeSubscriptionHealth(cfg.Subscription.ProcessedStateFile+".health.json", "authenticated")
 				fingerprint, expiresAt, due := groupchat.ALFProactiveRefreshDue(
 					session.Cookies,
 					now,
 					time.Duration(cfg.Subscription.ProactiveRefreshBeforeExpiryHours)*time.Hour,
 				)
 				if !due {
-					continue
+					fingerprint = "periodic-sso"
 				}
 				claimed, claimErr := groupchat.ClaimALFProactiveRefresh(cfg.Subscription.AuthRefreshStateFile, fingerprint, now)
 				if claimErr != nil {
-					logger.Info("记录 ALF 预刷新状态失败", "err", claimErr)
+					logger.Info("记录登录态刷新状态失败", "err", claimErr)
 					continue
 				}
 				if claimed {
@@ -486,7 +507,9 @@ func isDefinitiveAuthValidationError(err error) bool {
 		return false
 	}
 	message := strings.ToLower(err.Error())
-	return strings.Contains(message, "http 401") ||
+	return strings.Contains(message, "auth failed") ||
+		strings.Contains(message, "cookie expires or invalid") ||
+		strings.Contains(message, "http 401") ||
 		strings.Contains(message, "http 403") ||
 		strings.Contains(message, "cookie 为空") ||
 		strings.Contains(message, "unauthorized") ||
@@ -503,4 +526,43 @@ func waitForRetry(ctx context.Context, duration time.Duration) error {
 	case <-timer.C:
 		return nil
 	}
+}
+
+// Authentication failures stay in-process so systemd does not churn browsers.
+func acquireSubscriptionAuthWithRetry(ctx context.Context, cfg *config.GroupChatModeConfig, logger *slog.Logger, notifier *telegram.Client, force bool) (*groupchat.AuthSession, error) {
+	delay := time.Minute
+	for ctx.Err() == nil {
+		_ = writeSubscriptionHealth(cfg.Subscription.ProcessedStateFile+".health.json", "authenticating")
+		session, err := groupchat.AcquireAuthSession(ctx, cfg, logger, force)
+		if err == nil {
+			if err := notifyGroupChatAuthRecovery(ctx, notifier, cfg.Subscription.RuntimeAlertStateFile); err != nil {
+				logger.Error("记录认证恢复失败", "err", err)
+			}
+			return session, nil
+		}
+		// A proactive refresh failure must not discard credentials that still work.
+		if force {
+			if cookies, loadErr := groupchat.LoadStoredCookies(cfg.Subscription.CookieCacheFile); loadErr == nil {
+				if current, checkErr := groupchat.ValidateStoredCookies(ctx, cookies); checkErr == nil && (cfg.Subscription.ExpectedUID == "" || current.UID == cfg.Subscription.ExpectedUID) {
+					logger.Warn("主动刷新失败，保留仍有效的登录态", "err", err)
+					return current, nil
+				}
+			}
+		}
+		_ = writeSubscriptionHealth(cfg.Subscription.ProcessedStateFile+".health.json", "auth_failed")
+		logger.Error("群聊认证失败，退避后重试", "err", err, "retry_after", delay)
+		if notifier.Enabled() && ctx.Err() == nil {
+			if _, alertErr := notifyGroupChatAuthFailureOnce(ctx, notifier, cfg.Subscription.RuntimeAlertStateFile, err); alertErr != nil {
+				logger.Error("认证告警发送失败", "err", alertErr)
+			}
+		}
+		if err := waitForRetry(ctx, delay); err != nil {
+			return nil, err
+		}
+		delay *= 2
+		if delay > 30*time.Minute {
+			delay = 30 * time.Minute
+		}
+	}
+	return nil, ctx.Err()
 }

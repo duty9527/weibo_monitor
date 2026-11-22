@@ -602,3 +602,73 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 func (fn roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
 	return fn(r)
 }
+
+func TestSendRecordOversizeFallsBackWithoutUpload(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "large.mp4")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Truncate(maxUploadBytes + 1); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	c := NewClient(config.TelegramConfig{Enabled: true}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	calls := 0
+	c.httpClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		calls++
+		if !strings.HasSuffix(r.URL.Path, "sendMessage") {
+			t.Fatal("oversized media uploaded", r.URL.Path)
+		}
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"ok":true}`))}, nil
+	})}
+	if err := c.SendRecord(t.Context(), &weibo.WeiboRecord{ID: "large", SourceURL: "https://weibo.com/1/abc", LocalMediaPaths: []string{path}}); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 {
+		t.Fatal(calls)
+	}
+}
+
+func TestSendRecord413FallsBackWithoutRepeatingUpload(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "small.mp4")
+	if err := os.WriteFile(path, []byte("test"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	c := NewClient(config.TelegramConfig{Enabled: true}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	uploads, texts := 0, 0
+	c.httpClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if strings.HasSuffix(r.URL.Path, "sendMessage") {
+			texts++
+			return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"ok":true}`))}, nil
+		}
+		uploads++
+		return &http.Response{StatusCode: 413, Body: io.NopCloser(strings.NewReader(`{"ok":false,"description":"Request Entity Too Large"}`))}, nil
+	})}
+	if err := c.SendRecord(t.Context(), &weibo.WeiboRecord{ID: "413", SourceURL: "https://weibo.com/1/abc", LocalMediaPaths: []string{path}}); err != nil {
+		t.Fatal(err)
+	}
+	if uploads != 1 || texts != 1 {
+		t.Fatal(uploads, texts)
+	}
+}
+
+func TestRetryAfterControlsRateLimitWait(t *testing.T) {
+	c := NewClient(config.TelegramConfig{Enabled: true}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	calls := 0
+	var waited time.Duration
+	c.retryWait = func(_ context.Context, d time.Duration) error { waited = d; return nil }
+	c.httpClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		calls++
+		if calls == 1 {
+			return &http.Response{StatusCode: 429, Body: io.NopCloser(strings.NewReader(`{"ok":false,"parameters":{"retry_after":42}}`))}, nil
+		}
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"ok":true}`))}, nil
+	})}
+	if err := c.SendText(t.Context(), "test"); err != nil {
+		t.Fatal(err)
+	}
+	if waited < 42*time.Second || calls != 2 {
+		t.Fatal(waited, calls)
+	}
+}

@@ -43,7 +43,7 @@ func AcquireAuthSession(ctx context.Context, cfg *config.GroupChatModeConfig, lo
 	if !forceBrowser {
 		cookies, err := LoadStoredCookies(cfg.Subscription.CookieCacheFile)
 		if err == nil {
-			if session, err := validateStoredCookies(ctx, cookies); err == nil {
+			if session, err := validateStoredCookies(ctx, cookies); err == nil && (cfg.Subscription.ExpectedUID == "" || session.UID == cfg.Subscription.ExpectedUID) {
 				fingerprint, expiresAt, due := ALFProactiveRefreshDue(cookies, time.Now(), time.Duration(cfg.Subscription.ProactiveRefreshBeforeExpiryHours)*time.Hour)
 				if due {
 					claimed, claimErr := ClaimALFProactiveRefresh(cfg.Subscription.AuthRefreshStateFile, fingerprint, time.Now())
@@ -52,7 +52,7 @@ func AcquireAuthSession(ctx context.Context, cfg *config.GroupChatModeConfig, lo
 						return session, nil
 					}
 					if claimed {
-						logger.Info("ALF 即将过期，尝试一次无头 Playwright 预刷新", "expires_at", expiresAt.Format(time.RFC3339))
+						logger.Info("登录凭据即将过期，尝试无头 Playwright 预刷新", "expires_at", expiresAt.Format(time.RFC3339))
 						if refreshed, refreshErr := refreshStoredCookiesHeadless(ctx, cfg, logger); refreshErr == nil {
 							return refreshed, nil
 						} else {
@@ -68,6 +68,15 @@ func AcquireAuthSession(ctx context.Context, cfg *config.GroupChatModeConfig, lo
 		}
 	}
 
+	if !forceBrowser {
+		if session, err := loadFallbackAuth(ctx, cfg); err == nil {
+			if err := SaveStoredCookies(cfg.Subscription.CookieCacheFile, session.Cookies); err != nil {
+				return nil, err
+			}
+			logger.Info("已通过微博监控的同账号登录快照恢复群聊认证", "uid", session.UID)
+			return session, nil
+		}
+	}
 	logger.Info("尝试通过无头浏览器恢复微博登录态")
 	if session, err := refreshStoredCookiesHeadless(ctx, cfg, logger); err == nil {
 		return session, nil
@@ -75,6 +84,9 @@ func AcquireAuthSession(ctx context.Context, cfg *config.GroupChatModeConfig, lo
 		logger.Info("无头浏览器中没有有效登录态", "reason", err)
 	}
 
+	if os.Getenv("DISPLAY") == "" && os.Getenv("WAYLAND_DISPLAY") == "" {
+		return nil, fmt.Errorf("微博登录态失效，自动恢复失败；请在图形会话中使用相同配置运行登录流程完成扫码，再重启监听服务")
+	}
 	logger.Info("正在打开微博登录页面；请使用微博手机客户端扫码")
 	cookies, err := extractCookiesWithPlaywright(ctx, cfg, logger, false, true)
 	if err != nil {
@@ -111,6 +123,9 @@ func validateRefreshedCookies(ctx context.Context, cfg *config.GroupChatModeConf
 	session, err := validateStoredCookies(ctx, cookies)
 	if err != nil {
 		return nil, err
+	}
+	if cfg.Subscription.ExpectedUID != "" && session.UID != cfg.Subscription.ExpectedUID {
+		return nil, fmt.Errorf("登录账号与 expected_uid 不匹配")
 	}
 	checkCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
@@ -149,21 +164,22 @@ func ALFProactiveRefreshDue(cookies []StoredCookie, now time.Time, before time.D
 		return "", time.Time{}, false
 	}
 	var expiresAt time.Time
-	var domain string
+	var domain, name string
 	for _, cookie := range cookies {
-		if !strings.EqualFold(strings.TrimSpace(cookie.Name), "ALF") || cookie.Expires <= 0 {
+		if (cookie.Name != "ALF" && cookie.Name != "SUB" && cookie.Name != "SUBP") || cookie.Expires <= 0 {
 			continue
 		}
 		candidate := time.Unix(int64(cookie.Expires), 0)
-		if expiresAt.IsZero() || candidate.After(expiresAt) {
+		if expiresAt.IsZero() || candidate.Before(expiresAt) {
 			expiresAt = candidate
 			domain = strings.ToLower(strings.TrimSpace(cookie.Domain))
+			name = cookie.Name
 		}
 	}
 	if expiresAt.IsZero() || expiresAt.After(now.Add(before)) {
 		return "", expiresAt, false
 	}
-	fingerprint := fmt.Sprintf("ALF|%s|%d", domain, expiresAt.Unix())
+	fingerprint := fmt.Sprintf("%s|%s|%d", name, domain, expiresAt.Unix())
 	return fingerprint, expiresAt, true
 }
 
@@ -180,7 +196,7 @@ func ClaimALFProactiveRefresh(path, fingerprint string, now time.Time) (bool, er
 	} else if !os.IsNotExist(err) {
 		return false, fmt.Errorf("读取认证刷新状态失败: %w", err)
 	}
-	if state.LastALFFingerprint == fingerprint {
+	if last, err := time.Parse(time.RFC3339, state.LastAttemptAt); err == nil && now.Sub(last) < 6*time.Hour {
 		return false, nil
 	}
 	state.LastALFFingerprint = fingerprint
@@ -257,6 +273,18 @@ func extractCookiesWithPlaywright(
 		return nil, fmt.Errorf("启动持久化浏览器失败: %w", err)
 	}
 	defer browser.Close()
+	if session, err := loadFallbackAuth(ctx, cfg); err == nil {
+		seed := make([]playwright.OptionalCookie, 0, len(session.Cookies))
+		for _, c := range session.Cookies {
+			if c.Expires > 0 && c.Expires < float64(time.Now().Unix()) {
+				continue
+			}
+			seed = append(seed, playwright.OptionalCookie{Name: c.Name, Value: c.Value, Domain: playwright.String(c.Domain), Path: playwright.String(c.Path), Expires: playwright.Float(c.Expires), HttpOnly: playwright.Bool(c.HTTPOnly), Secure: playwright.Bool(c.Secure)})
+		}
+		if err := browser.AddCookies(seed); err != nil {
+			return nil, fmt.Errorf("导入同账号登录快照失败: %w", err)
+		}
+	}
 
 	pages := browser.Pages()
 	var page playwright.Page
@@ -271,11 +299,24 @@ func extractCookiesWithPlaywright(
 	if !headless {
 		_ = page.BringToFront()
 	}
+	// The main site runs SSO renewal; the WebIM page alone does not renew it.
+	if _, err := page.Goto("https://weibo.com/"); err != nil {
+		logger.Warn("访问微博主站刷新 SSO 失败", "err", err)
+	}
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-time.After(3 * time.Second):
+	}
 	if _, err := page.Goto(cfg.Chat.URL); err != nil {
 		logger.Warn("打开微博群聊登录页返回错误，将继续检查登录态", "err", err)
 	}
 
-	deadline := time.Now().Add(time.Duration(cfg.Subscription.LoginTimeoutSeconds) * time.Second)
+	wait := time.Duration(cfg.Subscription.LoginTimeoutSeconds) * time.Second
+	if !waitForLogin {
+		wait = 20 * time.Second
+	}
+	deadline := time.Now().Add(wait)
 	for {
 		cookies, cookieErr := browser.Cookies()
 		if cookieErr == nil {
@@ -288,10 +329,10 @@ func extractCookiesWithPlaywright(
 			}
 		}
 
-		if !waitForLogin {
-			return nil, fmt.Errorf("持久化浏览器中暂无有效微博登录态")
-		}
 		if time.Now().After(deadline) {
+			if !waitForLogin {
+				return nil, fmt.Errorf("主站 SSO 刷新后仍无有效群聊登录态")
+			}
 			return nil, fmt.Errorf("等待扫码登录超时（%d 秒）", cfg.Subscription.LoginTimeoutSeconds)
 		}
 		select {
@@ -303,6 +344,8 @@ func extractCookiesWithPlaywright(
 }
 
 func QueryCurrentUID(ctx context.Context, cookieHeader string, client *http.Client) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
 	if strings.TrimSpace(cookieHeader) == "" {
 		return "", fmt.Errorf("微博 Cookie 为空")
 	}
@@ -442,4 +485,32 @@ func convertPlaywrightCookies(cookies []playwright.Cookie) []StoredCookie {
 		})
 	}
 	return stored
+}
+
+func loadFallbackAuth(ctx context.Context, cfg *config.GroupChatModeConfig) (*AuthSession, error) {
+	if cfg.Subscription.FallbackCookieFile == "" || cfg.Subscription.ExpectedUID == "" {
+		return nil, fmt.Errorf("未配置同账号登录快照与 expected_uid")
+	}
+	cookies, err := LoadStoredCookies(cfg.Subscription.FallbackCookieFile)
+	if err != nil {
+		return nil, err
+	}
+	return validateRefreshedCookies(ctx, cfg, cookies)
+}
+
+// Persisted scheduling survives both process restarts and frequent Bayeux reconnects.
+func PeriodicAuthRefreshDue(path string, now time.Time, interval time.Duration) (bool, error) {
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	var state authRefreshState
+	if err := json.Unmarshal(data, &state); err != nil {
+		return false, err
+	}
+	last, err := time.Parse(time.RFC3339, state.LastAttemptAt)
+	return err != nil || !now.Before(last.Add(interval)), nil
 }

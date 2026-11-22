@@ -3,12 +3,15 @@ package weibo
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -18,10 +21,75 @@ import (
 	"weibo_group_chat_monitor/config"
 )
 
+const (
+	defaultVerifyBaseURL    = "https://weibo.com"
+	defaultVerifyTimeout    = 10 * time.Second
+	defaultVerifyAttempts   = 3
+	defaultVerifyRetryDelay = time.Second
+	sessionSnapshotFilename = "weibo_session_cookies.json"
+)
+
+var hasInteractiveDisplay = defaultHasInteractiveDisplay
+
+func defaultHasInteractiveDisplay() bool {
+	if runtime.GOOS == "darwin" || runtime.GOOS == "windows" {
+		return true
+	}
+	return strings.TrimSpace(os.Getenv("DISPLAY")) != "" ||
+		strings.TrimSpace(os.Getenv("WAYLAND_DISPLAY")) != ""
+}
+
+// CookieVerifyError 表示微博 Cookie 校验失败及是否属于可恢复的瞬时异常。
+type CookieVerifyError struct {
+	Transient  bool
+	StatusCode int
+	Err        error
+}
+
+func (e *CookieVerifyError) Error() string {
+	if e == nil {
+		return ""
+	}
+	if e.Err != nil {
+		return e.Err.Error()
+	}
+	if e.StatusCode != 0 {
+		return fmt.Sprintf("HTTP %d", e.StatusCode)
+	}
+	return "微博 Cookie 校验失败"
+}
+
+func (e *CookieVerifyError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
+func isTransientCookieVerifyError(err error) bool {
+	var verifyErr *CookieVerifyError
+	return errors.As(err, &verifyErr) && verifyErr.Transient
+}
+
+type sessionCookieSnapshot struct {
+	Name     string  `json:"name"`
+	Value    string  `json:"value"`
+	Domain   string  `json:"domain"`
+	Path     string  `json:"path"`
+	Expires  float64 `json:"expires"`
+	HTTPOnly bool    `json:"http_only"`
+	Secure   bool    `json:"secure"`
+}
+
 // CookieExtractor 从浏览器用户数据目录提取微博 Cookie。
 type CookieExtractor struct {
-	userDataDir string
-	logger      *slog.Logger
+	userDataDir      string
+	logger           *slog.Logger
+	verifyClient     *http.Client
+	verifyBaseURL    string
+	verifyAttempts   int
+	verifyRetryDelay time.Duration
+	launchSession    func(ctx context.Context, cfg config.WeiboConfig, headless bool, waitForLogin bool) (string, error)
 }
 
 type ExtractResult struct {
@@ -31,7 +99,14 @@ type ExtractResult struct {
 
 // NewCookieExtractor 创建提取器。
 func NewCookieExtractor(userDataDir string, logger *slog.Logger) *CookieExtractor {
-	return &CookieExtractor{userDataDir: userDataDir, logger: logger}
+	return &CookieExtractor{
+		userDataDir:      userDataDir,
+		logger:           logger,
+		verifyClient:     &http.Client{Timeout: defaultVerifyTimeout},
+		verifyBaseURL:    defaultVerifyBaseURL,
+		verifyAttempts:   defaultVerifyAttempts,
+		verifyRetryDelay: defaultVerifyRetryDelay,
+	}
 }
 
 // ExtractOrLogin 优先尝试直接读取 Cookie，失败后使用纯 Go Playwright 打开持久化上下文读取/等待登录。
@@ -46,14 +121,18 @@ func (e *CookieExtractor) ExtractOrLogin(ctx context.Context, cfg config.WeiboCo
 // ExtractOrLoginResult 返回 Cookie 和是否使用了 Playwright。
 func (e *CookieExtractor) ExtractOrLoginResult(ctx context.Context, cfg config.WeiboConfig) (*ExtractResult, error) {
 	cookieStr, err := e.Extract(ctx)
-	if err == nil && cookieStr != "" && VerifyCookies(ctx, cookieStr, cfg.TargetUID) {
-		e.logger.Info("通过本地存储直接读取到有效 Cookie")
-		return &ExtractResult{CookieString: cookieStr}, nil
-	}
-	if err != nil {
+	if err == nil && cookieStr != "" {
+		verifyErr := e.verifyCookies(ctx, cookieStr, cfg.TargetUID)
+		if verifyErr == nil {
+			e.logger.Info("通过本地存储直接读取到有效 Cookie")
+			return &ExtractResult{CookieString: cookieStr}, nil
+		}
+		if isTransientCookieVerifyError(verifyErr) {
+			return nil, fmt.Errorf("校验本地微博 Cookie 时发生网络异常: %w", verifyErr)
+		}
+		e.logger.Warn("本地直读拿到的 Cookie 校验未通过，切换到 Playwright 持久化上下文", "err", verifyErr)
+	} else if err != nil {
 		e.logger.Info("本地直读未拿到可用 Cookie，切换到 Playwright 持久化上下文", "reason", err)
-	} else {
-		e.logger.Info("本地直读拿到的 Cookie 校验未通过，切换到 Playwright 持久化上下文")
 	}
 
 	cookieStr, err = e.ExtractViaPlaywright(ctx, cfg)
@@ -67,7 +146,17 @@ func (e *CookieExtractor) ExtractOrLoginResult(ctx context.Context, cfg config.W
 func (e *CookieExtractor) Extract(ctx context.Context) (string, error) {
 	e.logger.Info("正在从浏览器用户数据目录提取 Cookie...")
 
-	cookieStr, err := e.readChromiumCookies(ctx)
+	snapshotPath := filepath.Join(e.userDataDir, sessionSnapshotFilename)
+	cookieStr, err := readSessionSnapshot(snapshotPath, time.Now())
+	if err == nil && cookieStr != "" {
+		e.logger.Info("成功从共享登录快照提取 Cookie")
+		return cookieStr, nil
+	}
+	if err != nil && !os.IsNotExist(err) {
+		e.logger.Warn("读取共享登录快照失败", "err", err)
+	}
+
+	cookieStr, err = e.readChromiumCookies(ctx)
 	if err == nil && cookieStr != "" {
 		e.logger.Info("成功从浏览器数据库提取 Cookie")
 		return cookieStr, nil
@@ -91,13 +180,26 @@ func (e *CookieExtractor) Extract(ctx context.Context) (string, error) {
 
 // ExtractViaPlaywright 使用纯 Go Playwright 启动持久化上下文，必要时等待用户登录。
 func (e *CookieExtractor) ExtractViaPlaywright(ctx context.Context, cfg config.WeiboConfig) (string, error) {
-	if cookieStr, err := e.extractViaPlaywrightSession(ctx, cfg, true, false); err == nil && cookieStr != "" {
-		return cookieStr, nil
-	} else if err != nil {
-		e.logger.Warn("Playwright 无头模式未拿到有效 Cookie，将切换为可交互模式", "err", err)
+	sessionRunner := e.extractViaPlaywrightSession
+	if e.launchSession != nil {
+		sessionRunner = e.launchSession
 	}
 
-	return e.extractViaPlaywrightSession(ctx, cfg, false, true)
+	cookieStr, headlessErr := sessionRunner(ctx, cfg, true, false)
+	if headlessErr == nil && cookieStr != "" {
+		return cookieStr, nil
+	}
+	if !hasInteractiveDisplay() {
+		if headlessErr != nil {
+			return "", fmt.Errorf("Playwright 无头模式未获取到有效 Cookie，且当前无图形会话（跳过有头浏览器降级）: %w", headlessErr)
+		}
+		return "", fmt.Errorf("Playwright 无头模式未获取到有效 Cookie，且当前无图形会话（跳过有头浏览器降级）")
+	}
+	if headlessErr != nil {
+		e.logger.Warn("Playwright 无头模式未拿到有效 Cookie，将切换为可交互模式", "err", headlessErr)
+	}
+
+	return sessionRunner(ctx, cfg, false, true)
 }
 
 // RefreshViaPlaywright 使用持久化浏览器上下文主动访问微博，尝试刷新登录态但不等待人工登录。
@@ -163,11 +265,15 @@ func (e *CookieExtractor) extractViaPlaywrightSession(
 		page.WaitForTimeout(3000)
 	}
 
-	if cookieStr, err := e.readValidCookiesFromContext(ctx, browserContext, cfg); err == nil && cookieStr != "" {
+	cookieStr, readErr := e.readValidCookiesFromContext(ctx, browserContext, cfg)
+	if readErr == nil && cookieStr != "" {
 		return cookieStr, nil
 	}
 
 	if !waitForLogin {
+		if readErr != nil {
+			return "", readErr
+		}
 		return "", fmt.Errorf("持久化上下文中暂无有效微博 Cookie")
 	}
 
@@ -232,8 +338,14 @@ func (e *CookieExtractor) readValidCookiesFromContext(
 	if cookieStr == "" {
 		return "", fmt.Errorf("Playwright context 中暂无微博 Cookie")
 	}
-	if !VerifyCookies(ctx, cookieStr, cfg.TargetUID) {
-		return "", fmt.Errorf("Playwright context 中的微博 Cookie 尚未生效，当前已读到 Cookie: %s", joinCookieNames(cookies))
+	if err := e.verifyCookies(ctx, cookieStr, cfg.TargetUID); err != nil {
+		return "", fmt.Errorf("Playwright context 中的微博 Cookie 校验失败（已读到 Cookie: %s）: %w", joinCookieNames(cookies), err)
+	}
+	// Publish a private snapshot, never share the live Chromium profile/lock.
+	if all, err := browserContext.Cookies(); err == nil {
+		if err := saveSessionSnapshot(filepath.Join(e.userDataDir, sessionSnapshotFilename), all); err != nil {
+			e.logger.Warn("导出共享登录快照失败", "err", err)
+		}
 	}
 	return cookieStr, nil
 }
@@ -341,20 +453,220 @@ func (e *CookieExtractor) readChromiumCookies(ctx context.Context) (string, erro
 
 // VerifyCookies 验证 Cookie 是否有效。
 func VerifyCookies(ctx context.Context, cookieStr, targetUID string) bool {
-	client := &http.Client{Timeout: 10 * time.Second}
-	apiURL := fmt.Sprintf("https://weibo.com/ajax/statuses/mymblog?uid=%s&page=1&feature=0", targetUID)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
-	if err != nil {
-		return false
+	return VerifyCookiesDetailed(ctx, cookieStr, targetUID) == nil
+}
+
+// VerifyCookiesDetailed 验证 Cookie 是否有效，并返回可区分瞬时网络错误与登录失效的详细错误。
+func VerifyCookiesDetailed(ctx context.Context, cookieStr, targetUID string) error {
+	return verifyCookiesWithClient(
+		ctx,
+		&http.Client{Timeout: defaultVerifyTimeout},
+		defaultVerifyBaseURL,
+		cookieStr,
+		targetUID,
+		defaultVerifyAttempts,
+		defaultVerifyRetryDelay,
+	)
+}
+
+func (e *CookieExtractor) verifyCookies(ctx context.Context, cookieStr, targetUID string) error {
+	client := e.verifyClient
+	if client == nil {
+		client = &http.Client{Timeout: defaultVerifyTimeout}
 	}
-	for key, value := range buildSessionHeaders(cookieStr, targetUID) {
-		req.Header.Set(key, value)
+	baseURL := strings.TrimSpace(e.verifyBaseURL)
+	if baseURL == "" {
+		baseURL = defaultVerifyBaseURL
+	}
+	attempts := e.verifyAttempts
+	if attempts <= 0 {
+		attempts = defaultVerifyAttempts
+	}
+	delay := e.verifyRetryDelay
+	if delay <= 0 {
+		delay = defaultVerifyRetryDelay
+	}
+	return verifyCookiesWithClient(ctx, client, baseURL, cookieStr, targetUID, attempts, delay)
+}
+
+func verifyCookiesWithClient(
+	ctx context.Context,
+	client *http.Client,
+	baseURL string,
+	cookieStr string,
+	targetUID string,
+	attempts int,
+	baseDelay time.Duration,
+) error {
+	if attempts <= 0 {
+		attempts = 1
+	}
+	if baseDelay <= 0 {
+		baseDelay = defaultVerifyRetryDelay
+	}
+	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	apiURL := fmt.Sprintf("%s/ajax/statuses/mymblog?uid=%s&page=1&feature=0", baseURL, targetUID)
+
+	var lastErr error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
+		if err != nil {
+			return &CookieVerifyError{Transient: false, Err: err}
+		}
+		for key, value := range buildSessionHeaders(cookieStr, targetUID) {
+			req.Header.Set(key, value)
+		}
+
+		resp, err := client.Do(req)
+		if err != nil {
+			lastErr = &CookieVerifyError{Transient: true, Err: err}
+			if ctx.Err() != nil || attempt == attempts {
+				return lastErr
+			}
+			if !sleepWithContext(ctx, baseDelay<<(attempt-1)) {
+				return &CookieVerifyError{Transient: true, Err: ctx.Err()}
+			}
+			continue
+		}
+
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 512))
+		resp.Body.Close()
+
+		if resp.StatusCode == http.StatusRequestTimeout ||
+			resp.StatusCode == http.StatusTooManyRequests ||
+			resp.StatusCode >= http.StatusInternalServerError {
+			lastErr = &CookieVerifyError{
+				Transient:  true,
+				StatusCode: resp.StatusCode,
+				Err:        fmt.Errorf("HTTP %d", resp.StatusCode),
+			}
+			if attempt == attempts {
+				return lastErr
+			}
+			if !sleepWithContext(ctx, baseDelay<<(attempt-1)) {
+				return &CookieVerifyError{Transient: true, Err: ctx.Err()}
+			}
+			continue
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			return &CookieVerifyError{
+				Transient:  false,
+				StatusCode: resp.StatusCode,
+				Err:        fmt.Errorf("HTTP %d", resp.StatusCode),
+			}
+		}
+
+		contentType := strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Type")))
+		if strings.HasPrefix(contentType, "text/html") {
+			return &CookieVerifyError{
+				Transient:  false,
+				StatusCode: resp.StatusCode,
+				Err:        fmt.Errorf("微博接口返回 HTML 登录页"),
+			}
+		}
+
+		return nil
 	}
 
-	resp, err := client.Do(req)
-	if err != nil {
+	return lastErr
+}
+
+func sleepWithContext(ctx context.Context, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
 		return false
+	case <-timer.C:
+		return true
 	}
-	defer resp.Body.Close()
-	return resp.StatusCode == http.StatusOK
+}
+
+func readSessionSnapshot(path string, now time.Time) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+
+	var rows []sessionCookieSnapshot
+	if err := json.Unmarshal(data, &rows); err != nil {
+		return "", fmt.Errorf("解析共享登录快照失败: %w", err)
+	}
+
+	order := make([]string, 0, len(rows))
+	values := make(map[string]string, len(rows))
+	exactDomain := make(map[string]bool, len(rows))
+
+	for _, c := range rows {
+		name := strings.TrimSpace(c.Name)
+		value := strings.TrimSpace(c.Value)
+		if name == "" || value == "" {
+			continue
+		}
+		rawDomain := strings.ToLower(strings.TrimSpace(c.Domain))
+		host := strings.TrimPrefix(rawDomain, ".")
+		if host != "weibo.com" && !strings.HasSuffix(host, ".weibo.com") {
+			continue
+		}
+		if c.Expires > 0 && time.Unix(int64(c.Expires), 0).Before(now) {
+			continue
+		}
+
+		isExact := rawDomain == "weibo.com"
+		if _, exists := values[name]; !exists {
+			order = append(order, name)
+			values[name] = value
+			exactDomain[name] = isExact
+			continue
+		}
+		if isExact || !exactDomain[name] {
+			values[name] = value
+			if isExact {
+				exactDomain[name] = true
+			}
+		}
+	}
+
+	if len(order) == 0 {
+		return "", fmt.Errorf("共享登录快照中没有有效的 weibo.com Cookie")
+	}
+
+	parts := make([]string, 0, len(order))
+	for _, name := range order {
+		parts = append(parts, name+"="+values[name])
+	}
+	return strings.Join(parts, "; "), nil
+}
+
+func saveSessionSnapshot(path string, cookies []playwright.Cookie) error {
+	rows := make([]map[string]any, 0, len(cookies))
+	for _, c := range cookies {
+		host := strings.TrimPrefix(c.Domain, ".")
+		if host != "weibo.com" && host != "sina.com.cn" && host != "weibo.cn" && !strings.HasSuffix(host, ".weibo.com") {
+			continue
+		}
+		rows = append(rows, map[string]any{"name": c.Name, "value": c.Value, "domain": c.Domain, "path": c.Path, "expires": c.Expires, "http_only": c.HttpOnly, "secure": c.Secure})
+	}
+	data, err := json.Marshal(rows)
+	if err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".session-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name())
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), path)
 }

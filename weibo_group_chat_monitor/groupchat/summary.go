@@ -200,7 +200,7 @@ func summaryLineTime(record OutputRecord) string {
 	if !ok {
 		return strings.TrimSpace(record.Time)
 	}
-	return parsed.Format("15:04:05")
+	return parsed.Format("2006年01月02日 15:04:05")
 }
 
 func summaryLineText(record OutputRecord) string {
@@ -218,5 +218,5 @@ func summaryLineText(record OutputRecord) string {
 }
 
 func formatSenderSummaryEntry(record OutputRecord) string {
-	return fmt.Sprintf("%s %s", summaryLineTime(record), summaryLineText(record))
+	return fmt.Sprintf("%s\n%s", summaryLineTime(record), summaryLineText(record))
 }

@@ -76,3 +76,30 @@ func TestCompactRuntimeAlertError(t *testing.T) {
 		t.Fatalf("error was not compacted: %q", message)
 	}
 }
+
+func TestRuntimeAuthAlertReminderAndRecovery(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "alert.json")
+	if err := saveRuntimeAlertState(path, runtimeAlertState{Active: true, Sent: true, AlertedAt: "2020-01-01T00:00:00Z"}); err != nil {
+		t.Fatal(err)
+	}
+	sender := &recordingRuntimeAlertSender{}
+	if sent, err := notifyGroupChatAuthFailureOnce(t.Context(), sender, path, errors.New("expired")); err != nil || !sent {
+		t.Fatal(sent, err)
+	}
+	sender.err = errors.New("network")
+	if err := notifyGroupChatAuthRecovery(t.Context(), sender, path); err == nil {
+		t.Fatal("recovery delivery must be persisted only on success")
+	}
+	state, _ := loadRuntimeAlertState(path)
+	if !state.Active {
+		t.Fatal("lost recovery notification")
+	}
+	sender.err = nil
+	if err := notifyGroupChatAuthRecovery(t.Context(), sender, path); err != nil {
+		t.Fatal(err)
+	}
+	state, _ = loadRuntimeAlertState(path)
+	if state.Active {
+		t.Fatal("not cleared")
+	}
+}

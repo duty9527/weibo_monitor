@@ -29,7 +29,9 @@ func notifyGroupChatAuthFailureOnce(ctx context.Context, sender runtimeAlertSend
 		return false, err
 	}
 	if state.Active && state.Sent {
-		return false, nil
+		if last, err := time.Parse(time.RFC3339, state.AlertedAt); err == nil && time.Since(last) < 24*time.Hour {
+			return false, nil
+		}
 	}
 	now := time.Now()
 	if !state.Active {
@@ -45,7 +47,7 @@ func notifyGroupChatAuthFailureOnce(ctx context.Context, sender runtimeAlertSend
 	message := strings.Join([]string{
 		"⚠️ #运行异常",
 		"微博群聊实时监控认证恢复失败",
-		"缓存 Cookie、无头浏览器恢复和扫码登录均未成功，实时消息可能已经中断。",
+		"缓存 Cookie 和自动恢复未成功，监控正在退避重试；必要时需要人工扫码。",
 		"时间：" + now.In(time.Local).Format("2006-01-02 15:04:05"),
 		"错误：" + compactRuntimeAlertError(authErr),
 	}, "\n")
@@ -122,11 +124,22 @@ func compactRuntimeAlertError(err error) string {
 	if err == nil {
 		return "未知认证错误"
 	}
-	message := strings.Join(strings.Fields(err.Error()), " ")
+	message := telegramTokenPattern.ReplaceAllString(strings.Join(strings.Fields(err.Error()), " "), "bot[REDACTED]")
 	const maxRunes = 600
 	runes := []rune(message)
 	if len(runes) > maxRunes {
 		message = string(runes[:maxRunes]) + "…"
 	}
 	return message
+}
+
+func notifyGroupChatAuthRecovery(ctx context.Context, sender runtimeAlertSender, path string) error {
+	state, err := loadRuntimeAlertState(path)
+	if err != nil || !state.Active {
+		return err
+	}
+	if err := sender.SendText(ctx, "✅ 微博群聊认证已恢复，将重新订阅并检查历史缺口。"); err != nil {
+		return err
+	}
+	return clearGroupChatAuthFailureAlert(path)
 }

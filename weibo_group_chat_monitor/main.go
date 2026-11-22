@@ -18,6 +18,10 @@ func run(args []string) int {
 	}
 
 	switch mode {
+	case "weibo-auth":
+		return runWeiboAuthMode(remaining)
+	case "groupchat-auth":
+		return runGroupChatAuthMode(remaining)
 	case "weibo":
 		return runWeiboMode(remaining)
 	case "groupchat":
@@ -85,6 +89,8 @@ func usageText() string {
   go run . groupchat-history -config config.groupchat.yaml
   go run . groupchat-media-retry -config config.groupchat.yaml
   go run . -mode=weibo
+  go run . weibo-auth -config config.weibo.yaml
+  go run . groupchat-auth -refresh -config config.groupchat.yaml
   go run . -mode=groupchat
   go run . -mode=groupchat-subscribe
   go run . -mode=groupchat-history

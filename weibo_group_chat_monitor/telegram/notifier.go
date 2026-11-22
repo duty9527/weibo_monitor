@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -107,7 +108,7 @@ func (c *Client) retryMaxAttempts() int {
 	return defaultRetryMaxAttempts
 }
 
-func (c *Client) waitBeforeRetry(ctx context.Context, failedAttempt int) error {
+func (c *Client) waitBeforeRetry(ctx context.Context, failedAttempt int, failures ...error) error {
 	delay := defaultRetryInitialDelay
 	if c.cfg.RetryInitialDelaySecs > 0 {
 		delay = time.Duration(c.cfg.RetryInitialDelaySecs) * time.Second
@@ -115,6 +116,12 @@ func (c *Client) waitBeforeRetry(ctx context.Context, failedAttempt int) error {
 	// failedAttempt 从 1 开始：第 1 次失败等待初始间隔，之后指数退避。
 	for i := 1; i < failedAttempt; i++ {
 		delay *= 2
+	}
+	for _, failure := range failures {
+		var limited *rateLimitError
+		if errors.As(failure, &limited) && limited.Delay > delay {
+			delay = limited.Delay
+		}
 	}
 	if c.retryWait == nil {
 		return waitForRetry(ctx, delay)
@@ -485,6 +492,32 @@ func (c *Client) SendRecord(ctx context.Context, record *weibo.WeiboRecord) erro
 
 	body := formatRecordMessage(record)
 	items := buildMediaItems(record.LocalMediaPaths)
+	safe := items[:0]
+	omitted := 0
+	for _, item := range items {
+		info, err := os.Stat(item.Path)
+		if err != nil {
+			return fmt.Errorf("检查微博媒体失败: %w", err)
+		}
+		if info.Size() > maxUploadBytes {
+			omitted++
+			continue
+		}
+		safe = append(safe, item)
+	}
+	items = safe
+	if omitted > 0 {
+		record.MediaDeliveryDegraded = true
+		body += "\n提示：部分媒体超过上传大小限制，请打开原微博查看。"
+	}
+	sendSet := func(caption string) error {
+		err := c.sendMediaSet(ctx, items, caption)
+		if isMediaTooLarge(err) {
+			record.MediaDeliveryDegraded = true
+			return c.sendText(ctx, body+"\n提示：Telegram 拒绝了过大的媒体，请打开原微博查看。", false)
+		}
+		return err
+	}
 	enablePreview := len(items) == 0 && strings.TrimSpace(record.SourceURL) != ""
 
 	if len(items) == 0 {
@@ -500,7 +533,7 @@ func (c *Client) SendRecord(ctx context.Context, record *weibo.WeiboRecord) erro
 
 	canUseCaption := len([]rune(body)) <= captionLimit
 	if canUseCaption {
-		if err := c.sendMediaSet(ctx, items, body); err != nil {
+		if err := sendSet(body); err != nil {
 			return err
 		}
 	} else {
@@ -508,7 +541,7 @@ func (c *Client) SendRecord(ctx context.Context, record *weibo.WeiboRecord) erro
 		if err := c.sendText(ctx, body, false); err != nil {
 			return err
 		}
-		if err := c.sendMediaSet(ctx, items, ""); err != nil {
+		if err := sendSet(""); err != nil {
 			return err
 		}
 	}
@@ -565,7 +598,7 @@ func (c *Client) sendTextChunk(ctx context.Context, text string, enablePreview b
 			lastErr = err
 			c.logger.Warn("发送 Telegram 文本消息失败，将进行重试...", "retry", i+1, "max", maxRetries, "err", err)
 			if i < maxRetries-1 {
-				if err := c.waitBeforeRetry(ctx, i+1); err != nil {
+				if err := c.waitBeforeRetry(ctx, i+1, lastErr); err != nil {
 					return err
 				}
 			}
@@ -578,7 +611,7 @@ func (c *Client) sendTextChunk(ctx context.Context, text string, enablePreview b
 			lastErr = err
 			c.logger.Warn("发送 Telegram 文本消息响应错误，将进行重试...", "retry", i+1, "max", maxRetries, "err", err)
 			if i < maxRetries-1 {
-				if err := c.waitBeforeRetry(ctx, i+1); err != nil {
+				if err := c.waitBeforeRetry(ctx, i+1, lastErr); err != nil {
 					return err
 				}
 			}
@@ -621,7 +654,7 @@ func (c *Client) sendMarkdownText(ctx context.Context, text string) error {
 			lastErr = err
 			c.logger.Warn("发送 Telegram Markdown 文本消息失败，将进行重试...", "retry", i+1, "max", maxRetries, "err", err)
 			if i < maxRetries-1 {
-				if err := c.waitBeforeRetry(ctx, i+1); err != nil {
+				if err := c.waitBeforeRetry(ctx, i+1, lastErr); err != nil {
 					return err
 				}
 			}
@@ -634,7 +667,7 @@ func (c *Client) sendMarkdownText(ctx context.Context, text string) error {
 			lastErr = err
 			c.logger.Warn("发送 Telegram Markdown 文本消息响应错误，将进行重试...", "retry", i+1, "max", maxRetries, "err", err)
 			if i < maxRetries-1 {
-				if err := c.waitBeforeRetry(ctx, i+1); err != nil {
+				if err := c.waitBeforeRetry(ctx, i+1, lastErr); err != nil {
 					return err
 				}
 			}
@@ -755,7 +788,7 @@ func (c *Client) sendSingleMediaWithMessageIDAs(ctx context.Context, item mediaI
 			lastErr = err
 			c.logger.Warn("发送 Telegram 媒体失败，将进行重试...", "retry", i+1, "max", maxRetries, "err", err)
 			if i < maxRetries-1 {
-				if err := c.waitBeforeRetry(ctx, i+1); err != nil {
+				if err := c.waitBeforeRetry(ctx, i+1, lastErr); err != nil {
 					return 0, err
 				}
 			}
@@ -765,6 +798,9 @@ func (c *Client) sendSingleMediaWithMessageIDAs(ctx context.Context, item mediaI
 		result, err := parseAPIResponse(method, resp)
 		resp.Body.Close()
 		if err != nil {
+			if isMediaTooLarge(err) {
+				return 0, err
+			}
 			// 图片/视频尺寸或格式不合法时，自动降级为 sendDocument 重试。此类业务配置错误，由外部重试降级即可，不进行循环内部重试
 			if mediaType != "document" && isTelegramMediaInvalidError(err) {
 				c.logger.Warn("媒体格式被 Telegram 拒绝，降级为 sendDocument 重试",
@@ -778,7 +814,7 @@ func (c *Client) sendSingleMediaWithMessageIDAs(ctx context.Context, item mediaI
 			lastErr = err
 			c.logger.Warn("发送 Telegram 媒体响应错误，将进行重试...", "retry", i+1, "max", maxRetries, "err", err)
 			if i < maxRetries-1 {
-				if err := c.waitBeforeRetry(ctx, i+1); err != nil {
+				if err := c.waitBeforeRetry(ctx, i+1, lastErr); err != nil {
 					return 0, err
 				}
 			}
@@ -864,7 +900,7 @@ func (c *Client) sendMediaGroup(ctx context.Context, items []mediaItem, caption 
 			lastErr = err
 			c.logger.Warn("发送 Telegram 图集失败，将进行重试...", "retry", i+1, "max", maxRetries, "err", err)
 			if i < maxRetries-1 {
-				if err := c.waitBeforeRetry(ctx, i+1); err != nil {
+				if err := c.waitBeforeRetry(ctx, i+1, lastErr); err != nil {
 					return err
 				}
 			}
@@ -875,6 +911,9 @@ func (c *Client) sendMediaGroup(ctx context.Context, items []mediaItem, caption 
 		resp.Body.Close()
 		if groupErr != nil {
 			// 媒体组中有不合法的图片/视频时，整组回退为逐个 sendDocument 发送。此类业务配置错误，不进行循环内部重试，直接执行降级
+			if isMediaTooLarge(groupErr) {
+				return groupErr
+			}
 			if isTelegramMediaInvalidError(groupErr) {
 				c.logger.Warn("sendMediaGroup 被 Telegram 拒绝，回退为逐个 sendDocument 发送",
 					"count", len(items),
@@ -897,7 +936,7 @@ func (c *Client) sendMediaGroup(ctx context.Context, items []mediaItem, caption 
 			lastErr = groupErr
 			c.logger.Warn("发送 Telegram 图集响应错误，将进行重试...", "retry", i+1, "max", maxRetries, "err", groupErr)
 			if i < maxRetries-1 {
-				if err := c.waitBeforeRetry(ctx, i+1); err != nil {
+				if err := c.waitBeforeRetry(ctx, i+1, lastErr); err != nil {
 					return err
 				}
 			}
@@ -992,7 +1031,7 @@ func (c *Client) editMessageCaptionMarkdown(ctx context.Context, messageID int, 
 			lastErr = err
 			c.logger.Warn("编辑 Telegram Markdown caption 失败，将进行重试...", "retry", i+1, "max", maxRetries, "err", err)
 			if i < maxRetries-1 {
-				if err := c.waitBeforeRetry(ctx, i+1); err != nil {
+				if err := c.waitBeforeRetry(ctx, i+1, lastErr); err != nil {
 					return err
 				}
 			}
@@ -1005,7 +1044,7 @@ func (c *Client) editMessageCaptionMarkdown(ctx context.Context, messageID int, 
 			lastErr = err
 			c.logger.Warn("编辑 Telegram Markdown caption 响应错误，将进行重试...", "retry", i+1, "max", maxRetries, "err", err)
 			if i < maxRetries-1 {
-				if err := c.waitBeforeRetry(ctx, i+1); err != nil {
+				if err := c.waitBeforeRetry(ctx, i+1, lastErr); err != nil {
 					return err
 				}
 			}
@@ -1271,6 +1310,17 @@ func splitText(text string, limit int) []string {
 
 func parseAPIResponse(method string, resp *http.Response) (*telegramMessage, error) {
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if resp.StatusCode == http.StatusTooManyRequests {
+		var limit struct {
+			Parameters struct {
+				RetryAfter int `json:"retry_after"`
+			} `json:"parameters"`
+		}
+		_ = json.Unmarshal(body, &limit)
+		if limit.Parameters.RetryAfter > 0 {
+			return nil, &rateLimitError{Delay: time.Duration(limit.Parameters.RetryAfter+1) * time.Second}
+		}
+	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("%s 返回 HTTP %d: %s", method, resp.StatusCode, strings.TrimSpace(string(body)))
 	}
@@ -1328,4 +1378,21 @@ func isTelegramMediaInvalidError(err error) bool {
 		}
 	}
 	return false
+}
+
+// Conservative cloud Bot API upload threshold; leave multipart headroom.
+const maxUploadBytes int64 = 49 * 1000 * 1000
+
+func isMediaTooLarge(err error) bool {
+	if err == nil {
+		return false
+	}
+	text := strings.ToLower(err.Error())
+	return strings.Contains(text, "http 413") || strings.Contains(text, "request entity too large") || strings.Contains(text, "file is too big")
+}
+
+type rateLimitError struct{ Delay time.Duration }
+
+func (e *rateLimitError) Error() string {
+	return fmt.Sprintf("Telegram HTTP 429; retry after %s", e.Delay)
 }

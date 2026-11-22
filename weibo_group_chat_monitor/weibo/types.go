@@ -7,15 +7,16 @@ import (
 
 // WeiboRecord 对应保存到 JSONL 文件的单条微博记录
 type WeiboRecord struct {
-	ID                string   `json:"id"`
-	CreatedAt         string   `json:"created_at"`
-	Text              string   `json:"text"`
-	SourceURL         string   `json:"source_url"`
-	MediaURLs         []string `json:"media_urls"`
-	LocalMediaPaths   []string `json:"local_media_paths"`
-	IsRetweet         bool     `json:"is_retweet"`
-	FailedMediaURLs   []string `json:"failed_media_urls,omitempty"`
-	SkippedMediaCount int      `json:"-"`
+	ID                    string   `json:"id"`
+	CreatedAt             string   `json:"created_at"`
+	Text                  string   `json:"text"`
+	SourceURL             string   `json:"source_url"`
+	MediaURLs             []string `json:"media_urls"`
+	LocalMediaPaths       []string `json:"local_media_paths"`
+	IsRetweet             bool     `json:"is_retweet"`
+	FailedMediaURLs       []string `json:"failed_media_urls,omitempty"`
+	MediaDeliveryDegraded bool     `json:"-"`
+	SkippedMediaCount     int      `json:"-"`
 }
 
 // WeiboItem 对应微博 API 返回的单条微博数据（仅使用字段）

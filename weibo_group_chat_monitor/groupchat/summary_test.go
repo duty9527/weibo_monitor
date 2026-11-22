@@ -43,10 +43,10 @@ func TestBuildSenderSummaryMessages(t *testing.T) {
 	if !strings.Contains(got, "alice发送了2条消息") {
 		t.Fatalf("expected sender summary, got %q", got)
 	}
-	if !strings.Contains(got, "08:00:00 第一条") {
+	if !strings.Contains(got, "2026年03月31日 08:00:00\n第一条") {
 		t.Fatalf("expected first line, got %q", got)
 	}
-	if !strings.Contains(got, "08:01:00 早上好[图片]") {
+	if !strings.Contains(got, "2026年03月31日 08:01:00\n早上好[图片]") {
 		t.Fatalf("expected image marker, got %q", got)
 	}
 }
@@ -89,7 +89,7 @@ func TestBuildSenderSummariesCollectsMediaPaths(t *testing.T) {
 	if got[0] != "/tmp/a.jpg" || got[1] != "/tmp/b.pdf" {
 		t.Fatalf("unexpected media paths: %#v", got)
 	}
-	if summaries[0].Entries[0].Text != "08:00:00 第一条[图片]" {
+	if summaries[0].Entries[0].Text != "2026年03月31日 08:00:00\n第一条[图片]" {
 		t.Fatalf("unexpected first entry text: %q", summaries[0].Entries[0].Text)
 	}
 }
@@ -127,7 +127,7 @@ func TestBuildSenderSummariesSplitsDatesAndSortsOldestFirst(t *testing.T) {
 	if len(summaries[0].Entries) != 2 {
 		t.Fatalf("expected 2 entries for oldest date, got %d", len(summaries[0].Entries))
 	}
-	if summaries[0].Entries[0].Text != "08:00:00 旧消息一" || summaries[0].Entries[1].Text != "10:00:00 旧消息二" {
+	if summaries[0].Entries[0].Text != "2026年08月15日 08:00:00\n旧消息一" || summaries[0].Entries[1].Text != "2026年08月15日 10:00:00\n旧消息二" {
 		t.Fatalf("oldest date entries are not chronological: %#v", summaries[0].Entries)
 	}
 	if !strings.Contains(summaries[1].Header, "2026年08月17日") {

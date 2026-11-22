@@ -22,6 +22,9 @@ chat:
   history_interval_milliseconds: 1500
 
 subscription:
+  # Optional same-account snapshot from the Weibo monitor; keep profiles separate.
+  fallback_cookie_file: ""
+  expected_uid: ""
   # Playwright 登录成功后写入，文件权限自动设为 0600
   cookie_cache_file: "groupchat_cookies.json"
   # 保留原始订阅事件，便于审计和排查未知事件类型

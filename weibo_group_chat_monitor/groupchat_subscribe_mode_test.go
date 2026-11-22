@@ -3,6 +3,9 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,6 +17,11 @@ import (
 )
 
 func TestIsSubscriptionAuthError(t *testing.T) {
+	for _, err := range []error{groupchat.ErrMediaAuthentication, fmt.Errorf("wrapped: %w", groupchat.ErrMediaAuthentication)} {
+		if !isSubscriptionAuthError(err) {
+			t.Fatal("media auth failure must trigger validation")
+		}
+	}
 	for _, message := range []string{"403:auth fail:create_denied", "HTTP 403", "HTTP 401", "create_denied", "unauthorized", "login required"} {
 		if !isSubscriptionAuthError(assertError(message)) {
 			t.Fatalf("expected auth error for %q", message)
@@ -25,7 +33,7 @@ func TestIsSubscriptionAuthError(t *testing.T) {
 }
 
 func TestIsDefinitiveAuthValidationError(t *testing.T) {
-	for _, message := range []string{"HTTP 401", "HTTP 403", "微博 Cookie 为空", "需要登录"} {
+	for _, message := range []string{"HTTP 401", "HTTP 403", "微博 Cookie 为空", "需要登录", "查询当前微博 UID 失败: Auth failed, Cookie expires or invalid. (21301)"} {
 		if !isDefinitiveAuthValidationError(assertError(message)) {
 			t.Fatalf("expected definitive auth error: %q", message)
 		}
@@ -111,6 +119,10 @@ func TestGroupChatNotificationWorkerSendsAndAcknowledges(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	_, err = outbox.Enqueue(groupchat.OutputRecord{ID: "system-notice", Sender: "renamed", SenderUID: "42", Message: "某人加入了群", MsgType: "system"})
+	if err != nil {
+		t.Fatal(err)
+	}
 	sender := &recordingGroupChatSender{sent: make(chan recordedGroupChatSummary, 1)}
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan struct{})
@@ -142,6 +154,11 @@ func TestGroupChatNotificationWorkerSendsAndAcknowledges(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("notification worker did not stop")
 	}
+	select {
+	case extra := <-sender.sent:
+		t.Fatalf("unexpected system notification: %#v", extra)
+	default:
+	}
 }
 
 type assertError string
@@ -155,4 +172,35 @@ func mustFileMode(t *testing.T, path string) os.FileMode {
 		t.Fatalf("stat %s failed: %v", path, err)
 	}
 	return info.Mode().Perm()
+}
+
+type authCheckTransport func(*http.Request) (*http.Response, error)
+
+func (f authCheckTransport) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestMediaAuthFailureRefreshDecision(t *testing.T) {
+	original := http.DefaultClient
+	defer func() { http.DefaultClient = original }()
+	for _, tc := range []struct {
+		name, body string
+		networkErr error
+		want       bool
+	}{
+		{name: "expired", body: `{"error":"Auth failed, Cookie expires or invalid.","error_code":21301}`, want: true},
+		{name: "valid", body: `{"profile":{"id":42}}`, want: false},
+		{name: "network", networkErr: fmt.Errorf("connection reset by peer"), want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			http.DefaultClient = &http.Client{Transport: authCheckTransport(func(r *http.Request) (*http.Response, error) {
+				if tc.networkErr != nil {
+					return nil, tc.networkErr
+				}
+				return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(tc.body)), Header: make(http.Header)}, nil
+			})}
+			session := &groupchat.AuthSession{Cookies: []groupchat.StoredCookie{{Name: "SUB", Value: "test", Domain: ".weibo.com"}}}
+			if got := shouldRefreshSubscriptionCookies(t.Context(), nil, session, fmt.Errorf("wrapped: %w", groupchat.ErrMediaAuthentication), discardWorkerLogger{}); got != tc.want {
+				t.Fatalf("refresh=%v want=%v", got, tc.want)
+			}
+		})
+	}
 }

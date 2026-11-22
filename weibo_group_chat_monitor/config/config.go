@@ -30,6 +30,8 @@ type GroupChatModeConfig struct {
 }
 
 type SubscriptionConfig struct {
+	FallbackCookieFile                string `yaml:"fallback_cookie_file"`
+	ExpectedUID                       string `yaml:"expected_uid"`
 	CookieCacheFile                   string `yaml:"cookie_cache_file"`
 	EventLogFile                      string `yaml:"event_log_file"`
 	EventLogRetentionDays             int    `yaml:"event_log_retention_days"`
@@ -374,6 +376,7 @@ func (c *GroupChatModeConfig) resolvePaths(baseDir string) {
 	c.Output.HistoryFile = resolvePath(baseDir, c.Output.HistoryFile)
 	c.Output.MediaDir = resolvePath(baseDir, c.Output.MediaDir)
 	c.State.StateFile = resolvePath(baseDir, c.State.StateFile)
+	c.Subscription.FallbackCookieFile = resolvePath(baseDir, c.Subscription.FallbackCookieFile)
 	c.Subscription.CookieCacheFile = resolvePath(baseDir, c.Subscription.CookieCacheFile)
 	c.Subscription.EventLogFile = resolvePath(baseDir, c.Subscription.EventLogFile)
 	c.Subscription.NotificationQueueFile = resolvePath(baseDir, c.Subscription.NotificationQueueFile)

@@ -1,11 +1,14 @@
 package groupchat
 
 import (
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+	"weibo_group_chat_monitor/config"
 )
 
 func TestALFProactiveRefreshDue(t *testing.T) {
@@ -31,7 +34,7 @@ func TestClaimALFProactiveRefreshOnlyOncePerExpiry(t *testing.T) {
 	if err != nil || claimed {
 		t.Fatalf("duplicate claim=%v err=%v", claimed, err)
 	}
-	claimed, err = ClaimALFProactiveRefresh(path, "ALF|weibo|2", now.Add(2*time.Hour))
+	claimed, err = ClaimALFProactiveRefresh(path, "ALF|weibo|2", now.Add(7*time.Hour))
 	if err != nil || !claimed {
 		t.Fatalf("new expiry claim=%v err=%v", claimed, err)
 	}
@@ -85,3 +88,60 @@ func TestSaveStoredCookiesUsesPrivatePermissions(t *testing.T) {
 		t.Fatalf("unexpected loaded cookies: %#v", got)
 	}
 }
+
+func TestRefreshUsesEarliestCredentialExpiry(t *testing.T) {
+	now := time.Now()
+	cookies := []StoredCookie{
+		{Name: "ALF", Domain: ".weibo.com", Expires: float64(now.Add(30 * 24 * time.Hour).Unix())},
+		{Name: "SUBP", Domain: ".sina.com.cn", Expires: float64(now.Add(24 * time.Hour).Unix())},
+	}
+	key, _, due := ALFProactiveRefreshDue(cookies, now, 96*time.Hour)
+	if !due || !strings.HasPrefix(key, "SUBP|") {
+		t.Fatalf("missed SSO expiry: %s %v", key, due)
+	}
+	path := filepath.Join(t.TempDir(), "refresh.json")
+	if ok, err := ClaimALFProactiveRefresh(path, key, now); err != nil || !ok {
+		t.Fatal(ok, err)
+	}
+	if ok, err := ClaimALFProactiveRefresh(path, key, now.Add(7*time.Hour)); err != nil || !ok {
+		t.Fatal("failed refresh must be retried", ok, err)
+	}
+}
+
+func TestPeriodicRefreshScheduleSurvivesReconnects(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "refresh.json")
+	now := time.Now().Truncate(time.Second)
+	if _, err := ClaimALFProactiveRefresh(path, "periodic", now); err != nil {
+		t.Fatal(err)
+	}
+	for _, elapsed := range []time.Duration{time.Minute, 3 * time.Hour, 6 * time.Hour, 7 * time.Hour} {
+		got, err := PeriodicAuthRefreshDue(path, now.Add(elapsed), 6*time.Hour)
+		if err != nil || got != (elapsed >= 6*time.Hour) {
+			t.Fatal(elapsed, got, err)
+		}
+	}
+}
+
+func TestFallbackRequiresPinnedMatchingAccount(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "snapshot.json")
+	if err := SaveStoredCookies(path, []StoredCookie{{Name: "SUB", Value: "test", Domain: ".weibo.com"}}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.GroupChatModeConfig{Subscription: config.SubscriptionConfig{FallbackCookieFile: path}}
+	if _, err := loadFallbackAuth(t.Context(), cfg); err == nil {
+		t.Fatal("must require pinned UID")
+	}
+	previous := http.DefaultClient
+	defer func() { http.DefaultClient = previous }()
+	http.DefaultClient = &http.Client{Transport: authTestTransport(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"profile":{"id":42}}`))}, nil
+	})}
+	cfg.Subscription.ExpectedUID = "different"
+	if _, err := loadFallbackAuth(t.Context(), cfg); err == nil || !strings.Contains(err.Error(), "expected_uid") {
+		t.Fatal("accepted wrong account", err)
+	}
+}
+
+type authTestTransport func(*http.Request) (*http.Response, error)
+
+func (f authTestTransport) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }

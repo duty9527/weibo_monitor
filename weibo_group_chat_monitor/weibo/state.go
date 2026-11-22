@@ -9,11 +9,20 @@ import (
 	"time"
 )
 
+type DeliveryState struct {
+	Sent          bool      `json:"sent"`
+	Attempts      int       `json:"attempts,omitempty"`
+	NextAttemptAt time.Time `json:"next_attempt_at,omitempty"`
+	LastError     string    `json:"last_error,omitempty"`
+}
+
 type RunState struct {
-	LastFetchedAt           string          `json:"last_fetched_at"`
-	LastPlaywrightRefreshAt string          `json:"last_playwright_refresh_at"`
-	SentMedia               map[string]bool `json:"sent_media,omitempty"`
-	LastPushedAt            string          `json:"last_pushed_at"`
+	DeliveryBaseline        *string                  `json:"delivery_baseline,omitempty"`
+	Deliveries              map[string]DeliveryState `json:"deliveries,omitempty"`
+	LastFetchedAt           string                   `json:"last_fetched_at"`
+	LastPlaywrightRefreshAt string                   `json:"last_playwright_refresh_at"`
+	SentMedia               map[string]bool          `json:"sent_media,omitempty"`
+	LastPushedAt            string                   `json:"last_pushed_at"`
 }
 
 func LoadRunState(path string) (*RunState, error) {
@@ -72,10 +81,23 @@ func SaveRunState(path string, state *RunState) error {
 		return fmt.Errorf("序列化状态文件失败: %w", err)
 	}
 	data = append(data, '\n')
-	if err := os.WriteFile(path, data, 0o644); err != nil {
-		return fmt.Errorf("写入状态文件失败: %w", err)
+	tmp, err := os.CreateTemp(dir, ".weibo-state-*")
+	if err != nil {
+		return err
 	}
-	return nil
+	defer os.Remove(tmp.Name())
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), path)
 }
 
 func (s *RunState) LastFetchedTime() (time.Time, bool) {

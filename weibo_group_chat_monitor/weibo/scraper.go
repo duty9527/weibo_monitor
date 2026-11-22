@@ -23,6 +23,9 @@ import (
 type Scraper struct {
 	cfg                *config.WeiboModeConfig
 	httpClient         *http.Client
+	mediaClient        *http.Client
+	mediaRetryAttempts int
+	mediaRetryDelay    time.Duration
 	sessionHeaders     map[string]string
 	logger             *slog.Logger
 	sinceTime          time.Time
@@ -31,15 +34,35 @@ type Scraper struct {
 	hasLatestFetchedAt bool
 }
 
+const (
+	defaultMediaRetryAttempts = 3
+	defaultMediaRetryDelay    = time.Second
+	defaultWeiboUserAgent     = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
+)
+
 // NewScraper 创建抓取器并解析时间节点。
 func NewScraper(cfg *config.WeiboModeConfig, logger *slog.Logger) (*Scraper, error) {
+	mediaTransport := &http.Transport{
+		ResponseHeaderTimeout: 15 * time.Second,
+	}
+	if baseTransport, ok := http.DefaultTransport.(*http.Transport); ok {
+		mediaTransport = baseTransport.Clone()
+		mediaTransport.ResponseHeaderTimeout = 15 * time.Second
+	}
+
 	s := &Scraper{
 		cfg: cfg,
 		httpClient: &http.Client{
 			Timeout: 15 * time.Second,
 		},
-		sessionHeaders: map[string]string{},
-		logger:         logger,
+		mediaClient: &http.Client{
+			Timeout:   120 * time.Second,
+			Transport: mediaTransport,
+		},
+		mediaRetryAttempts: defaultMediaRetryAttempts,
+		mediaRetryDelay:    defaultMediaRetryDelay,
+		sessionHeaders:     map[string]string{},
+		logger:             logger,
 	}
 
 	if strings.TrimSpace(cfg.Weibo.SinceTime) != "" {
@@ -242,26 +265,60 @@ func extractMedia(item *WeiboItem) []string {
 		urls = append(urls, bestVideoURL(item.PageInfo.MediaInfo))
 	}
 
+	seenPicIDs := make(map[string]struct{})
 	for _, pic := range item.PicInfos {
+		var chosen string
 		switch {
 		case pic.Mw2000 != nil && pic.Mw2000.URL != "":
-			urls = append(urls, pic.Mw2000.URL)
+			chosen = pic.Mw2000.URL
 		case pic.Original != nil && pic.Original.URL != "":
-			urls = append(urls, pic.Original.URL)
+			chosen = pic.Original.URL
 		case pic.Large != nil && pic.Large.URL != "":
-			urls = append(urls, pic.Large.URL)
+			chosen = pic.Large.URL
+		}
+		if chosen != "" {
+			urls = append(urls, chosen)
+			if id := mediaIDFromURL(chosen); id != "" {
+				seenPicIDs[id] = struct{}{}
+			}
 		}
 	}
 
+	mixedURLs := extractMixedMedia(item.MixMediaInfo)
+	for _, mixedURL := range mixedURLs {
+		if id := mediaIDFromURL(mixedURL); id != "" {
+			seenPicIDs[id] = struct{}{}
+		}
+	}
+	urls = append(urls, mixedURLs...)
+
 	if len(item.PicInfos) == 0 {
 		for _, pid := range item.PicIDs {
+			pid = strings.TrimSpace(pid)
+			if pid == "" {
+				continue
+			}
+			if _, ok := seenPicIDs[pid]; ok {
+				continue
+			}
 			urls = append(urls, fmt.Sprintf("https://wx1.sinaimg.cn/mw2000/%s.jpg", pid))
 		}
 	}
 
-	urls = append(urls, extractMixedMedia(item.MixMediaInfo)...)
-
 	return uniqueStrings(urls)
+}
+
+func mediaIDFromURL(rawURL string) string {
+	parsed, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil {
+		return ""
+	}
+	base := path.Base(parsed.Path)
+	if base == "" || base == "." || base == "/" {
+		return ""
+	}
+	ext := path.Ext(base)
+	return strings.TrimSuffix(base, ext)
 }
 
 func bestVideoURL(mi *MediaInfo) string {
@@ -400,8 +457,9 @@ func buildWeiboURL(targetUID string, item *WeiboItem) string {
 }
 
 // DownloadMedia 下载单个媒体文件，返回本地路径。
-func (s *Scraper) DownloadMedia(url string) string {
-	if url == "" {
+func (s *Scraper) DownloadMedia(rawURL string) string {
+	targetURL := normalizeMediaDownloadURL(rawURL)
+	if targetURL == "" {
 		return ""
 	}
 	if err := os.MkdirAll(s.cfg.Weibo.MediaDir, 0o755); err != nil {
@@ -409,45 +467,104 @@ func (s *Scraper) DownloadMedia(url string) string {
 		return ""
 	}
 
-	req, err := http.NewRequest(http.MethodGet, url, nil)
-	if err != nil {
-		s.logger.Error("下载失败", "url", url, "err", err)
-		return ""
-	}
-	req.Header.Set("User-Agent", s.sessionHeaders["User-Agent"])
-	req.Header.Set("Referer", "https://weibo.com/")
-	if cookieStr := s.sessionHeaders["Cookie"]; cookieStr != "" {
-		req.Header.Set("Cookie", cookieStr)
+	if hasKnownMediaFilename(targetURL) {
+		fpath := filepath.Join(s.cfg.Weibo.MediaDir, mediaFilename(targetURL, ""))
+		if info, err := os.Stat(fpath); err == nil && info.Size() > 0 {
+			return fpath
+		}
 	}
 
-	resp, err := s.httpClient.Do(req)
+	attempts := s.mediaRetryAttempts
+	if attempts <= 0 {
+		attempts = defaultMediaRetryAttempts
+	}
+	baseDelay := s.mediaRetryDelay
+	if baseDelay <= 0 {
+		baseDelay = defaultMediaRetryDelay
+	}
+
+	var lastErr error
+	var usedAttempts int
+	for attempt := 1; attempt <= attempts; attempt++ {
+		usedAttempts = attempt
+		fpath, retryable, err := s.downloadMediaOnce(targetURL)
+		if err == nil {
+			return fpath
+		}
+		lastErr = err
+		if !retryable || attempt == attempts {
+			break
+		}
+
+		delay := baseDelay << (attempt - 1)
+		s.logger.Warn(
+			"媒体下载失败，准备重试",
+			"url", targetURL,
+			"attempt", attempt,
+			"max_attempts", attempts,
+			"retry_after", delay,
+			"err", err,
+		)
+		time.Sleep(delay)
+	}
+
+	s.logger.Error("下载失败", "url", targetURL, "attempts", usedAttempts, "err", lastErr)
+	return ""
+}
+
+func (s *Scraper) downloadMediaOnce(targetURL string) (string, bool, error) {
+	req, err := http.NewRequest(http.MethodGet, targetURL, nil)
 	if err != nil {
-		s.logger.Error("下载失败", "url", url, "err", err)
-		return ""
+		return "", false, err
+	}
+
+	ua := strings.TrimSpace(s.sessionHeaders["User-Agent"])
+	if ua == "" {
+		ua = defaultWeiboUserAgent
+	}
+	req.Header.Set("User-Agent", ua)
+	req.Header.Set("Referer", "https://weibo.com/")
+	if parsed, parseErr := url.Parse(targetURL); parseErr == nil {
+		if strings.EqualFold(parsed.Scheme, "https") && shouldSendWeiboCookie(parsed.Hostname()) {
+			if cookieStr := s.sessionHeaders["Cookie"]; cookieStr != "" {
+				req.Header.Set("Cookie", cookieStr)
+			}
+		}
+	}
+
+	client := s.mediaClient
+	if client == nil {
+		client = s.httpClient
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", true, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		s.logger.Error("下载失败", "url", url, "status", resp.StatusCode)
-		return ""
-	}
-
-	filename := mediaFilename(url, resp.Header.Get("Content-Type"))
-	fpath := filepath.Join(s.cfg.Weibo.MediaDir, filename)
-	if _, err := os.Stat(fpath); err == nil {
-		return fpath
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+		retryable := resp.StatusCode == http.StatusRequestTimeout ||
+			resp.StatusCode == http.StatusTooManyRequests ||
+			resp.StatusCode >= http.StatusInternalServerError
+		return "", retryable, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
 
 	contentType := strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Type")))
 	if strings.HasPrefix(contentType, "text/html") || strings.HasPrefix(contentType, "application/json") {
-		s.logger.Error("下载失败，响应不是媒体文件", "url", url, "content_type", contentType)
-		return ""
+		return "", false, fmt.Errorf("响应不是媒体文件 (content_type=%s)", contentType)
+	}
+
+	filename := mediaFilename(targetURL, resp.Header.Get("Content-Type"))
+	fpath := filepath.Join(s.cfg.Weibo.MediaDir, filename)
+	if info, err := os.Stat(fpath); err == nil && info.Size() > 0 {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+		return fpath, false, nil
 	}
 
 	out, err := os.CreateTemp(s.cfg.Weibo.MediaDir, ".media-*")
 	if err != nil {
-		s.logger.Error("创建临时媒体文件失败", "path", fpath, "err", err)
-		return ""
+		return "", false, fmt.Errorf("创建临时媒体文件失败: %w", err)
 	}
 	tempPath := out.Name()
 	keepTemp := false
@@ -458,20 +575,69 @@ func (s *Scraper) DownloadMedia(url string) string {
 		}
 	}()
 
-	if _, err := io.Copy(out, resp.Body); err != nil {
-		s.logger.Error("写入文件失败", "path", fpath, "err", err)
-		return ""
+	written, err := io.Copy(out, resp.Body)
+	if err != nil {
+		return "", true, fmt.Errorf("写入文件失败: %w", err)
+	}
+	if written == 0 {
+		return "", true, fmt.Errorf("写入文件失败: 媒体响应为空")
 	}
 	if err := out.Close(); err != nil {
-		s.logger.Error("关闭媒体文件失败", "path", fpath, "err", err)
-		return ""
+		return "", false, fmt.Errorf("关闭媒体文件失败: %w", err)
 	}
 	if err := os.Rename(tempPath, fpath); err != nil {
-		s.logger.Error("保存媒体文件失败", "path", fpath, "err", err)
-		return ""
+		return "", false, fmt.Errorf("保存媒体文件失败: %w", err)
 	}
 	keepTemp = true
-	return fpath
+	return fpath, false, nil
+}
+
+func normalizeMediaDownloadURL(rawURL string) string {
+	trimmed := strings.TrimSpace(rawURL)
+	if trimmed == "" {
+		return ""
+	}
+	parsed, err := url.Parse(trimmed)
+	if err != nil {
+		return trimmed
+	}
+	if strings.EqualFold(parsed.Scheme, "http") && isWeiboMediaCDNHost(parsed.Hostname()) {
+		parsed.Scheme = "https"
+		return parsed.String()
+	}
+	return trimmed
+}
+
+func isWeiboMediaCDNHost(host string) bool {
+	host = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
+	return host == "weibocdn.com" ||
+		strings.HasSuffix(host, ".weibocdn.com") ||
+		host == "sinaimg.cn" ||
+		strings.HasSuffix(host, ".sinaimg.cn")
+}
+
+func shouldSendWeiboCookie(host string) bool {
+	host = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
+	return host == "weibo.com" ||
+		strings.HasSuffix(host, ".weibo.com") ||
+		host == "weibo.cn" ||
+		strings.HasSuffix(host, ".weibo.cn")
+}
+
+func hasKnownMediaFilename(rawURL string) bool {
+	parsed, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil {
+		return false
+	}
+	base := path.Base(parsed.Path)
+	if decoded, decodeErr := url.PathUnescape(base); decodeErr == nil {
+		base = decoded
+	}
+	base = filepath.Base(base)
+	if base == "" || base == "." || base == "/" {
+		return false
+	}
+	return isKnownMediaExtension(strings.ToLower(filepath.Ext(base)))
 }
 
 func mediaFilename(rawURL, contentType string) string {
