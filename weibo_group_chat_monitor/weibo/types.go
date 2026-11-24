@@ -66,6 +66,9 @@ type MediaInfo struct {
 
 // APIResponse 微博列表 API 响应结构
 type APIResponse struct {
+	OK   *int   `json:"ok"`
+	URL  string `json:"url"`
+	Msg  string `json:"msg"`
 	Data struct {
 		List []WeiboItem `json:"list"`
 	} `json:"data"`

@@ -271,10 +271,30 @@ func (e *CookieExtractor) extractViaPlaywrightSession(
 	}
 
 	if !waitForLogin {
-		if readErr != nil {
+		if readErr == nil {
+			readErr = fmt.Errorf("持久化上下文中暂无有效微博 Cookie")
+		} else if isTransientCookieVerifyError(readErr) || ctx.Err() != nil {
 			return "", readErr
 		}
-		return "", fmt.Errorf("持久化上下文中暂无有效微博 Cookie")
+
+		// Multi-hop Sina SSO redirects can take more than 3s after initial Goto.
+		deadline := time.Now().Add(15 * time.Second)
+		for time.Now().Before(deadline) {
+			if !sleepWithContext(ctx, 2*time.Second) {
+				return "", ctx.Err()
+			}
+			cookieStr, pollErr := e.readValidCookiesFromContext(ctx, browserContext, cfg)
+			if pollErr == nil && cookieStr != "" {
+				return cookieStr, nil
+			}
+			if pollErr != nil {
+				readErr = pollErr
+				if isTransientCookieVerifyError(pollErr) || ctx.Err() != nil {
+					return "", pollErr
+				}
+			}
+		}
+		return "", readErr
 	}
 
 	e.logger.Info(
@@ -529,12 +549,11 @@ func verifyCookiesWithClient(
 			continue
 		}
 
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 512))
-		resp.Body.Close()
-
 		if resp.StatusCode == http.StatusRequestTimeout ||
 			resp.StatusCode == http.StatusTooManyRequests ||
 			resp.StatusCode >= http.StatusInternalServerError {
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 512))
+			resp.Body.Close()
 			lastErr = &CookieVerifyError{
 				Transient:  true,
 				StatusCode: resp.StatusCode,
@@ -550,6 +569,8 @@ func verifyCookiesWithClient(
 		}
 
 		if resp.StatusCode != http.StatusOK {
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 512))
+			resp.Body.Close()
 			return &CookieVerifyError{
 				Transient:  false,
 				StatusCode: resp.StatusCode,
@@ -559,6 +580,8 @@ func verifyCookiesWithClient(
 
 		contentType := strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Type")))
 		if strings.HasPrefix(contentType, "text/html") {
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 512))
+			resp.Body.Close()
 			return &CookieVerifyError{
 				Transient:  false,
 				StatusCode: resp.StatusCode,
@@ -566,10 +589,39 @@ func verifyCookiesWithClient(
 			}
 		}
 
+		var payload struct {
+			OK  *int   `json:"ok"`
+			URL string `json:"url"`
+			Msg string `json:"msg"`
+		}
+		decodeErr := json.NewDecoder(io.LimitReader(resp.Body, 2<<20)).Decode(&payload)
+		resp.Body.Close()
+		if decodeErr != nil {
+			return &CookieVerifyError{
+				Transient:  false,
+				StatusCode: resp.StatusCode,
+				Err:        fmt.Errorf("解析微博接口响应失败: %w", decodeErr),
+			}
+		}
+		if payload.OK == nil || *payload.OK != 1 {
+			return &CookieVerifyError{
+				Transient:  false,
+				StatusCode: resp.StatusCode,
+				Err:        fmt.Errorf("微博接口返回未登录或异常状态 (ok=%s, url=%s, msg=%s)", formatOptionalInt(payload.OK), payload.URL, payload.Msg),
+			}
+		}
+
 		return nil
 	}
 
 	return lastErr
+}
+
+func formatOptionalInt(v *int) string {
+	if v == nil {
+		return "<nil>"
+	}
+	return fmt.Sprintf("%d", *v)
 }
 
 func sleepWithContext(ctx context.Context, delay time.Duration) bool {
@@ -606,7 +658,7 @@ func readSessionSnapshot(path string, now time.Time) (string, error) {
 		}
 		rawDomain := strings.ToLower(strings.TrimSpace(c.Domain))
 		host := strings.TrimPrefix(rawDomain, ".")
-		if host != "weibo.com" && !strings.HasSuffix(host, ".weibo.com") {
+		if host != "weibo.com" {
 			continue
 		}
 		if c.Expires > 0 && time.Unix(int64(c.Expires), 0).Before(now) {
@@ -642,8 +694,8 @@ func readSessionSnapshot(path string, now time.Time) (string, error) {
 func saveSessionSnapshot(path string, cookies []playwright.Cookie) error {
 	rows := make([]map[string]any, 0, len(cookies))
 	for _, c := range cookies {
-		host := strings.TrimPrefix(c.Domain, ".")
-		if host != "weibo.com" && host != "sina.com.cn" && host != "weibo.cn" && !strings.HasSuffix(host, ".weibo.com") {
+		host := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(c.Domain)), ".")
+		if !isSessionSnapshotHost(host) {
 			continue
 		}
 		rows = append(rows, map[string]any{"name": c.Name, "value": c.Value, "domain": c.Domain, "path": c.Path, "expires": c.Expires, "http_only": c.HttpOnly, "secure": c.Secure})
@@ -669,4 +721,10 @@ func saveSessionSnapshot(path string, cookies []playwright.Cookie) error {
 		return err
 	}
 	return os.Rename(tmp.Name(), path)
+}
+
+func isSessionSnapshotHost(host string) bool {
+	return host == "weibo.com" || strings.HasSuffix(host, ".weibo.com") ||
+		host == "sina.com.cn" || strings.HasSuffix(host, ".sina.com.cn") ||
+		host == "weibo.cn" || strings.HasSuffix(host, ".weibo.cn")
 }

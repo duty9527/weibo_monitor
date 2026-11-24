@@ -22,6 +22,7 @@ import (
 // Scraper 微博抓取核心逻辑。
 type Scraper struct {
 	cfg                *config.WeiboModeConfig
+	apiBaseURL         string
 	httpClient         *http.Client
 	mediaClient        *http.Client
 	mediaRetryAttempts int
@@ -35,6 +36,7 @@ type Scraper struct {
 }
 
 const (
+	defaultAPIBaseURL         = "https://weibo.com"
 	defaultMediaRetryAttempts = 3
 	defaultMediaRetryDelay    = time.Second
 	defaultWeiboUserAgent     = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
@@ -51,7 +53,8 @@ func NewScraper(cfg *config.WeiboModeConfig, logger *slog.Logger) (*Scraper, err
 	}
 
 	s := &Scraper{
-		cfg: cfg,
+		cfg:        cfg,
+		apiBaseURL: defaultAPIBaseURL,
 		httpClient: &http.Client{
 			Timeout: 15 * time.Second,
 		},
@@ -195,12 +198,16 @@ func (s *Scraper) doGet(ctx context.Context, url string) (*http.Response, error)
 }
 
 func (s *Scraper) fetchPage(ctx context.Context, page int) ([]WeiboItem, error) {
-	url := fmt.Sprintf(
-		"https://weibo.com/ajax/statuses/mymblog?uid=%s&page=%d&feature=0",
-		s.cfg.Weibo.TargetUID, page,
+	baseURL := strings.TrimRight(strings.TrimSpace(s.apiBaseURL), "/")
+	if baseURL == "" {
+		baseURL = defaultAPIBaseURL
+	}
+	apiURL := fmt.Sprintf(
+		"%s/ajax/statuses/mymblog?uid=%s&page=%d&feature=0",
+		baseURL, s.cfg.Weibo.TargetUID, page,
 	)
 
-	resp, err := s.doGet(ctx, url)
+	resp, err := s.doGet(ctx, apiURL)
 	if err != nil {
 		return nil, err
 	}
@@ -214,6 +221,9 @@ func (s *Scraper) fetchPage(ctx context.Context, page int) ([]WeiboItem, error) 
 	var apiResp APIResponse
 	if err := json.NewDecoder(resp.Body).Decode(&apiResp); err != nil {
 		return nil, fmt.Errorf("解析响应失败: %w", err)
+	}
+	if apiResp.OK != nil && *apiResp.OK != 1 {
+		return nil, fmt.Errorf("微博列表接口返回异常状态 (ok=%d, url=%s, msg=%s)", *apiResp.OK, apiResp.URL, apiResp.Msg)
 	}
 	return apiResp.Data.List, nil
 }

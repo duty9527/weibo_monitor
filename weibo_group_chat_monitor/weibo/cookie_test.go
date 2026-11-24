@@ -34,6 +34,8 @@ func TestReadSessionSnapshotFiltersDomainAndExpiry(t *testing.T) {
 		{Name: "SUB", Value: "sub-exact", Domain: "weibo.com", Expires: float64(now.Add(time.Hour).Unix())},
 		{Name: "XSRF-TOKEN", Value: "xsrf-val", Domain: "weibo.com", Expires: -1},
 		{Name: "EXPIRED", Value: "old", Domain: ".weibo.com", Expires: float64(now.Add(-time.Minute).Unix())},
+		{Name: "tid", Value: "passport-tid", Domain: ".passport.weibo.com", Expires: float64(now.Add(time.Hour).Unix())},
+		{Name: "ALC", Value: "login-alc", Domain: ".login.sina.com.cn", Expires: float64(now.Add(time.Hour).Unix())},
 		{Name: "SINA_ONLY", Value: "ignore-sina", Domain: ".sina.com.cn", Expires: float64(now.Add(time.Hour).Unix())},
 		{Name: "WEIBO_CN", Value: "ignore-cn", Domain: ".weibo.cn", Expires: float64(now.Add(time.Hour).Unix())},
 		{Name: "OTHER", Value: "ignore-other", Domain: ".evilweibo.com", Expires: float64(now.Add(time.Hour).Unix())},
@@ -237,4 +239,83 @@ func TestExtractViaPlaywrightSkipsHeadedFallbackWithoutDisplay(t *testing.T) {
 			t.Fatalf("expected [true, false], got %#v", calls)
 		}
 	})
+}
+
+func TestVerifyCookiesRejectsOKMinus100LoginJSON(t *testing.T) {
+	var attempts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts.Add(1)
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":-100,"url":"https://weibo.com/login.php?url=https%3A%2F%2Fweibo.com%2Fu%2F1401527553"}`))
+	}))
+	defer server.Close()
+
+	userDataDir := t.TempDir()
+	snapshotPath := filepath.Join(userDataDir, sessionSnapshotFilename)
+	data, err := json.Marshal([]sessionCookieSnapshot{
+		{Name: "SUB", Value: "expired-on-server", Domain: ".weibo.com", Expires: -1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(snapshotPath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	extractor := newTestCookieExtractor(t, userDataDir, server.URL)
+	var launchedHeadless bool
+	extractor.launchSession = func(ctx context.Context, cfg config.WeiboConfig, headless bool, waitForLogin bool) (string, error) {
+		launchedHeadless = headless && !waitForLogin
+		return "SUB=renewed", nil
+	}
+
+	err = extractor.verifyCookies(context.Background(), "SUB=expired-on-server", "1401527553")
+	if err == nil {
+		t.Fatalf("expected ok=-100 response to fail verification")
+	}
+	if isTransientCookieVerifyError(err) {
+		t.Fatalf("expected non-transient error for ok=-100, got: %v", err)
+	}
+	if attempts.Load() != 1 {
+		t.Fatalf("expected 1 verify attempt for ok=-100, got %d", attempts.Load())
+	}
+
+	res, err := extractor.ExtractOrLoginResult(context.Background(), config.WeiboConfig{TargetUID: "1401527553"})
+	if err != nil {
+		t.Fatalf("ExtractOrLoginResult failed: %v", err)
+	}
+	if !launchedHeadless || !res.UsedPlaywright || res.CookieString != "SUB=renewed" {
+		t.Fatalf("expected headless Playwright renewal after ok=-100, got launched=%v res=%+v", launchedHeadless, res)
+	}
+}
+
+func TestVerifyCookiesRejectsMissingOKAndInvalidJSON(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+	}{
+		{name: "missing ok", body: `{"data":{"list":[]}}`},
+		{name: "ok zero", body: `{"ok":0,"msg":"err"}`},
+		{name: "invalid json", body: `not-json`},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer server.Close()
+
+			extractor := newTestCookieExtractor(t, t.TempDir(), server.URL)
+			err := extractor.verifyCookies(context.Background(), "SUB=test", "1401527553")
+			if err == nil {
+				t.Fatalf("expected verification error for %s", tc.name)
+			}
+			if isTransientCookieVerifyError(err) {
+				t.Fatalf("expected non-transient error for %s, got: %v", tc.name, err)
+			}
+		})
+	}
 }

@@ -1,6 +1,7 @@
 package weibo
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -316,5 +317,24 @@ func TestExtractMediaSkipsDuplicatePicIDWhenPresentInMixMedia(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("got %#v, want %#v", got, want)
 		}
+	}
+}
+
+func TestFetchPageRejectsNonOKAPIResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":-100,"url":"https://weibo.com/login.php"}`))
+	}))
+	defer server.Close()
+
+	scraper := newTestScraper(t, t.TempDir())
+	scraper.apiBaseURL = server.URL
+
+	_, err := scraper.fetchPage(context.Background(), 1)
+	if err == nil {
+		t.Fatalf("expected error on ok=-100 response")
+	}
+	if !strings.Contains(err.Error(), "ok=-100") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
